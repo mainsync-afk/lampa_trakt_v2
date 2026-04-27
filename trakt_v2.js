@@ -9,7 +9,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '0.0.4';
+    var VERSION = '0.0.5';
     try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
@@ -220,12 +220,16 @@
         comp.cardRender = function (object, element, card) {
             card.onMenu = false;
             card.onEnter = function () {
+                // НЕ передаём `card` (инстанс Lampa.Card) — у него циклическая
+                // ссылка card → activity → component → activity, и JSON.stringify
+                // в Lampa.Activity.push падает на clone$1 (см. лог 1777324149834).
+                // Передаём наш plain card-data (`element`), он сериализуем.
                 Lampa.Activity.push({
                     url: '',
                     component: 'full',
                     id: element.id,
                     method: element.method,
-                    card: card,
+                    card: element,
                     source: 'tmdb'
                 });
             };
