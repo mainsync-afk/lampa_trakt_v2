@@ -9,7 +9,8 @@
 (function () {
     'use strict';
 
-    var VERSION = '2.0.0-mvp';
+    var VERSION = '0.0.2';
+    try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
     var API_URL = 'https://apx.lme.isroot.in/trakt';
@@ -203,7 +204,7 @@
         if (!$list.length) return;
         if ($list.find('[data-trakt-v2="' + MENU_DATA_ATTR + '"]').length) return;
 
-        var title = Lampa.Lang.translate('trakt_v2_menu_title');
+        var title = Lampa.Lang.translate('trakt_v2_menu_title') + ' ' + VERSION;
         var $item = $(
             '<li class="menu__item selector" data-trakt-v2="' + MENU_DATA_ATTR + '">' +
                 '<div class="menu__ico">' + ICON() + '</div>' +
@@ -259,8 +260,4 @@
 
     whenLampaReady();
 })();
-        }, 200);
-    }
-
-    whenLampaReady();
-})();
+   
