@@ -9,7 +9,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '0.0.3';
+    var VERSION = '0.0.4';
     try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
@@ -212,6 +212,25 @@
 
         comp.next = function () { /* no pagination on Phase 1 */ };
 
+        // Переопределяем onEnter каждой карточки. Без этого Lampa использует
+        // дефолтный обработчик, который игнорирует наш method и дёргает TMDB
+        // как /movie/<id>/... даже для сериалов (см. лог 1777323798508 — клик
+        // по show с tmdb_id=254953 уходил на /movie/254953/credits → 404).
+        // Паттерн взят из trakt_by_lampame.js:2958-2969.
+        comp.cardRender = function (object, element, card) {
+            card.onMenu = false;
+            card.onEnter = function () {
+                Lampa.Activity.push({
+                    url: '',
+                    component: 'full',
+                    id: element.id,
+                    method: element.method,
+                    card: card,
+                    source: 'tmdb'
+                });
+            };
+        };
+
         return comp;
     }
 
@@ -249,6 +268,7 @@
     }
 
     // ────────────────────────────────────────────────────────────────────
+    // ────────────────────────────────────────────────────────────────────
     // Bootstrap
     // ────────────────────────────────────────────────────────────────────
     function start() {
@@ -284,4 +304,3 @@
 
     whenLampaReady();
 })();
-   
