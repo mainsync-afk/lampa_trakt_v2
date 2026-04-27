@@ -112,18 +112,25 @@
         // Без tmdb_id full-card в Lampa не откроем. На Phase 1 такие айтемы пропускаем —
         // в Phase 1 расширении подключим резолв через /search/trakt/:id.
         if (!tmdbId) return null;
+        // Формат данных карточки — точно по образцу trakt_by_lampame.formatTraktResults
+        // (trakt_by_lampame.js:1617-1634). Ключевые моменты:
+        // - component: 'full' — без него Lampa.Card при клике не знает, какую активити открывать.
+        // - source НЕ задаём — Lampa берёт текущий источник из настроек пользователя
+        //   (например, cub-прокси), а не лезет в прямой TMDB, который может быть недоступен.
+        // - poster/image — пустые строки: без Trakt VIP их тут не построить, Lampa Card
+        //   подгрузит через текущий источник по id+method.
         return {
+            component: 'full',
             id: tmdbId,
+            ids: media.ids,
             title: media.title || '',
             original_title: media.title || '',
             release_date: media.year ? String(media.year) : '',
             vote_average: Number(media.rating || 0),
+            poster: '',
+            image: '',
             method: isMovie ? 'movie' : 'tv',
-            card_type: isMovie ? 'movie' : 'tv',
-            source: 'tmdb',
-            // прокидываем для будущих фаз
-            _trakt_ids: media.ids,
-            _trakt_listed_at: item.listed_at || null
+            card_type: isMovie ? 'movie' : 'tv'
         };
     }
 
@@ -157,7 +164,6 @@
         comp.create = function () {
             var self = this;
             if (!getToken()) {
-                // Нет токена — пустой экран с подсказкой авторизоваться
                 self.empty(Lampa.Lang.translate('trakt_v2_no_token'));
                 return;
             }
@@ -167,7 +173,6 @@
                         results: results,
                         total_pages: 1
                     });
-                    // одностраничная подача — выключаем подгрузку on-scroll-end
                     if (self.activity && self.activity.scroll) {
                         self.activity.scroll.onEnd = function () {};
                     }
@@ -189,7 +194,6 @@
     // DOM-инъекция пункта в левое меню
     // ────────────────────────────────────────────────────────────────────
     function ICON() {
-        // Простая SVG иконка — круг с галочкой (символика "пройдено" Trakt)
         return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="7 13 10 16 17 9"/></svg>';
     }
 
@@ -229,8 +233,6 @@
         registerLang();
         Lampa.Component.add(COMPONENT, MainComponent);
 
-        // Если приложение уже готово (плагин подгружен поздно) — инжектим сразу,
-        // иначе ждём app:ready.
         if (window.appready) {
             injectMenuItem();
         } else {
@@ -239,11 +241,9 @@
             });
         }
 
-        // Лог для диагностики
         try { console.log('[trakt_v2]', 'started, version', VERSION); } catch (_) {}
     }
 
-    // Ждём готовность Lampa — на TV runtime может подгружаться позже плагина.
     function whenLampaReady() {
         if (window.Lampa && Lampa.Activity && Lampa.Component && Lampa.Listener) {
             start();
@@ -254,6 +254,11 @@
                 clearInterval(iv);
                 start();
             }
+        }, 200);
+    }
+
+    whenLampaReady();
+})();
         }, 200);
     }
 
