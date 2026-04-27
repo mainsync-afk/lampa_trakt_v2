@@ -9,7 +9,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '0.0.2';
+    var VERSION = '0.0.3';
     try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
@@ -137,21 +137,45 @@
 
     function fetchWatchlist() {
         // Параллельно тянем фильмы и сериалы; объединяем; сортируем по listed_at desc.
+        // Ошибки сети логируем явно — иначе тихо схлопнутся в пустой массив и юзер
+        // увидит пустую страницу без понимания почему.
+        function fetchSafe(path) {
+            return apiGet(path).catch(function (err) {
+                try { console.warn('[trakt_v2] fetch failed', path, err); } catch (_) {}
+                return [];
+            });
+        }
         return Promise.all([
-            apiGet('/sync/watchlist/movies?extended=full').catch(function () { return []; }),
-            apiGet('/sync/watchlist/shows?extended=full').catch(function () { return []; })
+            fetchSafe('/sync/watchlist/movies?extended=full'),
+            fetchSafe('/sync/watchlist/shows?extended=full')
         ]).then(function (pair) {
-            var combined = [].concat(pair[0] || [], pair[1] || []);
+            var movies = pair[0] || [], shows = pair[1] || [];
+            var combined = [].concat(movies, shows);
             combined.sort(function (a, b) {
                 var ta = Date.parse(a.listed_at || '') || 0;
                 var tb = Date.parse(b.listed_at || '') || 0;
                 return tb - ta;
             });
             var results = [];
+            var dropped_no_tmdb = 0;
             for (var i = 0; i < combined.length; i++) {
                 var c = formatTraktItem(combined[i]);
-                if (c) results.push(c);
+                if (c) {
+                    results.push(c);
+                } else {
+                    dropped_no_tmdb++;
+                }
             }
+            try {
+                console.log(
+                    '[trakt_v2] fetchWatchlist:',
+                    'movies=' + movies.length,
+                    'shows=' + shows.length,
+                    'total=' + combined.length,
+                    'kept=' + results.length,
+                    'dropped_no_tmdb=' + dropped_no_tmdb
+                );
+            } catch (_) {}
             return results;
         });
     }
