@@ -1,7 +1,7 @@
 /*!
  * trakt_v2.js — Lampa-Trakt Plugin v2
- * Phase 1 + TMDB enrichment: пункт меню + Activity component + единый список Watchlist
- * с подгрузкой постеров и локализованных названий из TMDB.
+ * Phase 1 + classifier: пункт меню + Activity component + единый список
+ * по 5 статусам Trakt с TMDB-обогащением (постеры/локализация).
  *
  * Архитектура: см. SPEC_v2.md
  * Зависимости: Lampa runtime; токен Trakt берётся из Lampa.Storage (выпускается плагином trakt_by_lampame)
@@ -11,19 +11,35 @@
 (function () {
     'use strict';
 
-    var VERSION = '0.1.0';
+    var VERSION = '0.1.1';
     try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
     var API_URL = 'https://apx.lme.isroot.in/trakt';
     var STORAGE_TOKEN_KEY = 'trakt_token';
 
-    // TMDB. Ключ — встроенный в ядро Lampa (виден в логах при загрузке любого
-    // нативного TMDB-каталога), не наш собственный. Когда дойдём до Финальной
-    // независимости (см. SPEC §«Границы с trakt_by_lampame»), заменим на свой.
+    // TMDB. Ключ — встроенный в ядро Lampa. На Финальной независимости заменим на свой.
     var TMDB_URL = 'https://api.themoviedb.org/3';
     var TMDB_KEY = '4ef0d7355d9ffb5151e987764708ce96';
     var TMDB_IMG = 'https://image.tmdb.org/t/p';
+
+    // ────────────────────────────────────────────────────────────────────
+    // Status codes (внутренние, как в v1; UI отображает русские имена)
+    // ────────────────────────────────────────────────────────────────────
+    var STATUS = { WATCHLIST: 'watchlist', PROGRESS: 'progress', FINISHED: 'finished', UPCOMING: 'upcoming', DROPPED: 'dropped' };
+    var STATUS_ORDER = ['watchlist', 'progress', 'finished', 'upcoming', 'dropped'];
+    // Лейблы в UI. Английские — рабочие на этапе разработки и тестов;
+    // в финале можно перевести на русский / другой язык (см. SPEC §«Модель папок»).
+    // Английские слова намеренно отличаются от нативных Lampa-папок («Просмотрено»,
+    // «Брошено») — чтобы при появлении нашего сайдбара на детальной карточке (Phase 2)
+    // не было визуальной коллизии с нативным Lampa.Favorite.
+    var STATUS_LABEL = {
+        watchlist: { ru: 'Watchlist', en: 'Watchlist', uk: 'Watchlist' },
+        progress:  { ru: 'Progress',  en: 'Progress',  uk: 'Progress'  },
+        finished:  { ru: 'Finished',  en: 'Finished',  uk: 'Finished'  },
+        upcoming:  { ru: 'Upcoming',  en: 'Upcoming',  uk: 'Upcoming'  },
+        dropped:   { ru: 'Dropped',   en: 'Dropped',   uk: 'Dropped'   }
+    };
 
     // ────────────────────────────────────────────────────────────────────
     // Локализация
@@ -31,27 +47,14 @@
     function registerLang() {
         if (!window.Lampa || !Lampa.Lang || typeof Lampa.Lang.add !== 'function') return;
         Lampa.Lang.add({
-            trakt_v2_menu_title: {
-                ru: 'Trakt v2',
-                en: 'Trakt v2',
-                uk: 'Trakt v2'
-            },
-            trakt_v2_screen_title: {
-                ru: 'Trakt',
-                en: 'Trakt',
-                uk: 'Trakt'
-            },
-            trakt_v2_section_watchlist: {
-                ru: 'Закладки (Watchlist)',
-                en: 'Watchlist',
-                uk: 'Закладки (Watchlist)'
-            },
-            trakt_v2_no_token: {
+            trakt_v2_menu_title:        { ru: 'Trakt v2', en: 'Trakt v2', uk: 'Trakt v2' },
+            trakt_v2_screen_title:      { ru: 'Trakt',    en: 'Trakt',    uk: 'Trakt' },
+            trakt_v2_no_token:          {
                 ru: 'Войдите в Trakt через настройки плагина TraktTV',
                 en: 'Log in to Trakt via the TraktTV plugin settings',
                 uk: 'Увійдіть у Trakt через налаштування плагіна TraktTV'
             },
-            trakt_v2_load_error: {
+            trakt_v2_load_error:        {
                 ru: 'Не удалось загрузить данные из Trakt',
                 en: 'Failed to load Trakt data',
                 uk: 'Не вдалося завантажити дані з Trakt'
@@ -63,43 +66,25 @@
     // Network: Trakt
     // ────────────────────────────────────────────────────────────────────
     function getToken() {
-        try {
-            return String(Lampa.Storage.get(STORAGE_TOKEN_KEY) || '');
-        } catch (e) {
-            return '';
-        }
+        try { return String(Lampa.Storage.get(STORAGE_TOKEN_KEY) || ''); }
+        catch (e) { return ''; }
     }
 
-    /**
-     * Минимальный GET-helper к Trakt API через прокси.
-     * Использует XMLHttpRequest напрямую — контролируем таймаут и заголовки,
-     * не зависим от частной формы Lampa.Reguest. На Phase 1 хватает.
-     */
     function apiGet(path) {
         return new Promise(function (resolve, reject) {
             var token = getToken();
-            if (!token) {
-                reject({ status: 401, code: 'no_token' });
-                return;
-            }
+            if (!token) { reject({ status: 401, code: 'no_token' }); return; }
             var xhr = new XMLHttpRequest();
-            try {
-                xhr.open('GET', API_URL + path, true);
-            } catch (e) {
-                reject({ status: 0, code: 'open_failed', error: e });
-                return;
-            }
+            try { xhr.open('GET', API_URL + path, true); }
+            catch (e) { reject({ status: 0, code: 'open_failed', error: e }); return; }
             xhr.setRequestHeader('Content-Type', 'application/json');
             xhr.setRequestHeader('trakt-api-version', '2');
             xhr.setRequestHeader('Authorization', 'Bearer ' + token);
             xhr.timeout = 20000;
             xhr.onload = function () {
                 if (xhr.status >= 200 && xhr.status < 300) {
-                    try {
-                        resolve(xhr.responseText ? JSON.parse(xhr.responseText) : null);
-                    } catch (e) {
-                        reject({ status: 0, code: 'parse_error', error: e });
-                    }
+                    try { resolve(xhr.responseText ? JSON.parse(xhr.responseText) : null); }
+                    catch (e) { reject({ status: 0, code: 'parse_error', error: e }); }
                 } else {
                     reject({ status: xhr.status, code: 'http_error', body: xhr.responseText });
                 }
@@ -113,20 +98,11 @@
     // ────────────────────────────────────────────────────────────────────
     // Network: TMDB
     // ────────────────────────────────────────────────────────────────────
-    /**
-     * In-memory кэш TMDB-ответов на время сессии. Ключ — "<method>/<id>".
-     * Lampa и сама дёргает TMDB при открытии full-card, но мы кэшируем
-     * наш слой обогащения, чтобы при повторном открытии экрана Trakt v2
-     * не отправлять одни и те же запросы заново.
-     */
     var _tmdbCache = {};
 
     function tmdbLang() {
-        try {
-            // Lampa.Storage.get('language') может вернуть 'ru', 'en', 'uk'.
-            var l = String(Lampa.Storage.get('language') || 'ru');
-            return l || 'ru';
-        } catch (_) { return 'ru'; }
+        try { return String(Lampa.Storage.get('language') || 'ru') || 'ru'; }
+        catch (_) { return 'ru'; }
     }
 
     function tmdbGet(method, id) {
@@ -137,12 +113,8 @@
                       '?api_key=' + TMDB_KEY +
                       '&language=' + encodeURIComponent(tmdbLang());
             var xhr = new XMLHttpRequest();
-            try {
-                xhr.open('GET', url, true);
-            } catch (e) {
-                reject({ status: 0, code: 'open_failed', error: e });
-                return;
-            }
+            try { xhr.open('GET', url, true); }
+            catch (e) { reject({ status: 0, code: 'open_failed', error: e }); return; }
             xhr.timeout = 15000;
             xhr.onload = function () {
                 if (xhr.status >= 200 && xhr.status < 300) {
@@ -150,12 +122,8 @@
                         var data = xhr.responseText ? JSON.parse(xhr.responseText) : null;
                         _tmdbCache[key] = data;
                         resolve(data);
-                    } catch (e) {
-                        reject({ status: 0, code: 'parse_error', error: e });
-                    }
+                    } catch (e) { reject({ status: 0, code: 'parse_error', error: e }); }
                 } else {
-                    // 404 на TMDB бывает у свежих сериалов или удалённых записей —
-                    // не ошибка плагина. Логируем и идём дальше.
                     reject({ status: xhr.status, code: 'http_error' });
                 }
             };
@@ -166,21 +134,12 @@
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // Преобразование Trakt-айтема в формат card-data Lampa
+    // Card-data builders
     // ────────────────────────────────────────────────────────────────────
-    function formatTraktItem(item) {
-        if (!item) return null;
-        var media = item.movie || item.show;
+    function formatMedia(media, type) {
         if (!media || !media.ids) return null;
-        var isMovie = !!item.movie;
         var tmdbId = media.ids.tmdb || null;
-        // Без tmdb_id full-card в Lampa не откроем. На Phase 1 такие айтемы пропускаем —
-        // в Phase 1 расширении подключим резолв через /search/trakt/:id.
         if (!tmdbId) return null;
-        // Формат данных карточки — точно по образцу trakt_by_lampame.formatTraktResults
-        // (trakt_by_lampame.js:1617-1634). Ключевые моменты:
-        // - component: 'full' — без него Lampa.Card при клике не знает, какую активити открывать.
-        // - poster/image — пустые строки на старте, заполняются TMDB-обогащением.
         return {
             component: 'full',
             id: tmdbId,
@@ -193,19 +152,11 @@
             image: '',
             poster_path: '',
             backdrop_path: '',
-            method: isMovie ? 'movie' : 'tv',
-            card_type: isMovie ? 'movie' : 'tv'
+            method: type === 'movie' ? 'movie' : 'tv',
+            card_type: type === 'movie' ? 'movie' : 'tv'
         };
     }
 
-    /**
-     * Дополняем card данными из TMDB: постер, бэкдроп, локализованное название,
-     * рейтинг, дата выхода. Если TMDB упал — карточка остаётся как есть.
-     *
-     * Для movies TMDB отдаёт title/original_title/release_date,
-     * для tv — name/original_name/first_air_date. Мы маппим в общие поля
-     * card-data, которые читает Lampa.Card.
-     */
     function enrichWithTmdb(card) {
         return tmdbGet(card.method, card.id).then(function (data) {
             if (!data) return card;
@@ -230,9 +181,7 @@
                 card.name = data.name || card.title;
                 card.original_name = data.original_name || card.original_title;
             }
-            if (typeof data.vote_average === 'number') {
-                card.vote_average = data.vote_average;
-            }
+            if (typeof data.vote_average === 'number') card.vote_average = data.vote_average;
             if (Array.isArray(data.genres)) {
                 card.genres = data.genres;
                 card.genre_ids = data.genres.map(function (g) { return g.id; });
@@ -246,11 +195,42 @@
 
     function enrichAll(cards) {
         if (!cards || !cards.length) return Promise.resolve(cards);
-        // Параллельно — TMDB rate-limit ~50 rps на ключ, на 4-50 карточек запас огромный.
         return Promise.all(cards.map(enrichWithTmdb));
     }
 
-    function fetchWatchlist() {
+    // ────────────────────────────────────────────────────────────────────
+    // Classifier (SPEC §«Классификатор статуса»)
+    // ────────────────────────────────────────────────────────────────────
+    function classifyMovie(node) {
+        // hidden API не поддерживает type=movie, но если custom-list "Брошено"
+        // в будущем подключим — сюда зайдёт node.dropped через него.
+        if (node.dropped) return STATUS.DROPPED;
+        if (node.in_watched) return STATUS.FINISHED;
+        if (node.in_watchlist) return STATUS.WATCHLIST;
+        return null;
+    }
+
+    function classifyShow(node) {
+        if (node.dropped) return STATUS.DROPPED;
+        var p = node.progress;
+        var completed = p ? Number(p.completed || 0) : 0;
+        if (completed === 0) {
+            return node.in_watchlist ? STATUS.WATCHLIST : null;
+        }
+        var hasNext = p && p.next_episode;
+        if (hasNext) return STATUS.PROGRESS;
+        var s = String(node.media.status || '').toLowerCase();
+        if (s === 'ended' || s === 'canceled') return STATUS.FINISHED;
+        // returning series / in production / planned / pilot — всё это «ждём новых серий»
+        return STATUS.UPCOMING;
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Main fetch: тянем все 6 эндпоинтов параллельно, дедупим, доходим до
+    // /shows/:id/progress/watched для каждого show с completed > 0,
+    // классифицируем, обогащаем TMDB.
+    // ────────────────────────────────────────────────────────────────────
+    function fetchAll() {
         function fetchSafe(path) {
             return apiGet(path).catch(function (err) {
                 try { console.warn('[trakt_v2] fetch failed', path, err); } catch (_) {}
@@ -259,50 +239,162 @@
         }
         return Promise.all([
             fetchSafe('/sync/watchlist/movies?extended=full'),
-            fetchSafe('/sync/watchlist/shows?extended=full')
-        ]).then(function (pair) {
-            var movies = pair[0] || [], shows = pair[1] || [];
-            var combined = [].concat(movies, shows);
-            combined.sort(function (a, b) {
-                var ta = Date.parse(a.listed_at || '') || 0;
-                var tb = Date.parse(b.listed_at || '') || 0;
-                return tb - ta;
-            });
-            var results = [];
-            var dropped_no_tmdb = 0;
-            for (var i = 0; i < combined.length; i++) {
-                var c = formatTraktItem(combined[i]);
-                if (c) {
-                    results.push(c);
-                } else {
-                    dropped_no_tmdb++;
+            fetchSafe('/sync/watchlist/shows?extended=full'),
+            fetchSafe('/sync/watched/movies?extended=full'),
+            fetchSafe('/sync/watched/shows?extended=full'),
+            fetchSafe('/users/hidden/progress_watched?type=show&limit=1000'),
+            fetchSafe('/users/hidden/dropped?type=show&limit=1000')
+        ]).then(function (rows) {
+            var wlMovies      = rows[0] || [];
+            var wlShows       = rows[1] || [];
+            var watchedMovies = rows[2] || [];
+            var watchedShows  = rows[3] || [];
+            var hiddenPW      = rows[4] || [];
+            var hiddenDR      = rows[5] || [];
+
+            try {
+                console.log('[trakt_v2] raw fetch:',
+                    'wlMov=' + wlMovies.length,
+                    'wlSh=' + wlShows.length,
+                    'wMov=' + watchedMovies.length,
+                    'wSh=' + watchedShows.length,
+                    'hPW=' + hiddenPW.length,
+                    'hDR=' + hiddenDR.length);
+            } catch (_) {}
+
+            // Множество скрытых tmdb-id (только сериалы — hidden API без type=movie)
+            var droppedTmdb = {};
+            function addDropped(arr) {
+                for (var i = 0; i < arr.length; i++) {
+                    var s = arr[i] && arr[i].show;
+                    if (s && s.ids && s.ids.tmdb) droppedTmdb[s.ids.tmdb] = true;
                 }
             }
-            try {
-                console.log(
-                    '[trakt_v2] fetchWatchlist:',
-                    'movies=' + movies.length,
-                    'shows=' + shows.length,
-                    'total=' + combined.length,
-                    'kept=' + results.length,
-                    'dropped_no_tmdb=' + dropped_no_tmdb
-                );
-            } catch (_) {}
-            return enrichAll(results).then(function (enriched) {
-                try {
-                    var withPoster = 0;
-                    for (var i = 0; i < enriched.length; i++) {
-                        if (enriched[i].poster) withPoster++;
+            addDropped(hiddenPW);
+            addDropped(hiddenDR);
+
+            // Дедуп по ключу type:tmdb. Узел копит флаги принадлежности к источникам.
+            var byKey = {};
+            function ensureNode(type, media, listedAt) {
+                if (!media || !media.ids || !media.ids.tmdb) return null;
+                var k = type + ':' + media.ids.tmdb;
+                if (!byKey[k]) {
+                    byKey[k] = {
+                        type: type,
+                        media: media,
+                        listed_at: listedAt || null,
+                        in_watchlist: false,
+                        in_watched: false,
+                        progress: null,
+                        dropped: false
+                    };
+                } else {
+                    if (listedAt && (!byKey[k].listed_at || Date.parse(listedAt) > Date.parse(byKey[k].listed_at))) {
+                        byKey[k].listed_at = listedAt;
                     }
-                    console.log('[trakt_v2] tmdb enriched: with_poster=' + withPoster + '/' + enriched.length);
+                    // extended=full даёт media.status у show — берём ту версию media,
+                    // в которой это поле есть.
+                    if (!byKey[k].media.status && media.status) byKey[k].media = media;
+                }
+                return byKey[k];
+            }
+
+            function processWatchlist(arr, type) {
+                for (var i = 0; i < arr.length; i++) {
+                    var item = arr[i];
+                    var media = type === 'movie' ? item.movie : item.show;
+                    var n = ensureNode(type, media, item.listed_at);
+                    if (n) n.in_watchlist = true;
+                }
+            }
+            function processWatched(arr, type) {
+                for (var i = 0; i < arr.length; i++) {
+                    var item = arr[i];
+                    var media = type === 'movie' ? item.movie : item.show;
+                    var n = ensureNode(type, media, item.last_watched_at);
+                    if (n) n.in_watched = true;
+                }
+            }
+            processWatchlist(wlMovies, 'movie');
+            processWatchlist(wlShows,  'show');
+            processWatched(watchedMovies, 'movie');
+            processWatched(watchedShows,  'show');
+
+            // Помечаем dropped (только shows — hidden API без type=movie)
+            Object.keys(byKey).forEach(function (k) {
+                var n = byKey[k];
+                if (n.type === 'show' && n.media.ids.tmdb && droppedTmdb[n.media.ids.tmdb]) {
+                    n.dropped = true;
+                }
+            });
+
+            // Per-show progress fetch (только для shows в watched — иначе progress
+            // не нужен). Параллельно. На большой коллекции имеет смысл батчить,
+            // но Trakt rate limit 1000/5мин — на десятки шоу запас огромный.
+            var progressTargets = [];
+            Object.keys(byKey).forEach(function (k) {
+                var n = byKey[k];
+                if (n.type === 'show' && n.in_watched && !n.dropped && n.media.ids.trakt) {
+                    progressTargets.push(n);
+                }
+            });
+
+            return Promise.all(progressTargets.map(function (n) {
+                return apiGet('/shows/' + n.media.ids.trakt + '/progress/watched')
+                    .then(function (p) { n.progress = p; })
+                    .catch(function (err) {
+                        try { console.warn('[trakt_v2] progress fetch failed', n.media.ids.trakt, err); } catch (_) {}
+                    });
+            })).then(function () {
+                // Классификация + сборка card-data
+                var classified = [];
+                var counts = { watchlist: 0, progress: 0, finished: 0, upcoming: 0, dropped: 0 };
+                Object.keys(byKey).forEach(function (k) {
+                    var n = byKey[k];
+                    var status = n.type === 'movie' ? classifyMovie(n) : classifyShow(n);
+                    if (!status) return;
+                    var card = formatMedia(n.media, n.type);
+                    if (!card) return;
+                    card.trakt_status = status;
+                    card.trakt_listed_at = n.listed_at;
+                    classified.push(card);
+                    counts[status]++;
+                });
+
+                try {
+                    console.log('[trakt_v2] classifier:',
+                        'total=' + classified.length,
+                        'watchlist=' + counts.watchlist,
+                        'progress=' + counts.progress,
+                        'finished=' + counts.finished,
+                        'upcoming=' + counts.upcoming,
+                        'dropped=' + counts.dropped);
                 } catch (_) {}
-                return enriched;
+
+                // Сортировка: сначала по приоритету статуса, внутри — по listed_at desc
+                classified.sort(function (a, b) {
+                    var sa = STATUS_ORDER.indexOf(a.trakt_status);
+                    var sb = STATUS_ORDER.indexOf(b.trakt_status);
+                    if (sa !== sb) return sa - sb;
+                    var ta = Date.parse(a.trakt_listed_at || '') || 0;
+                    var tb = Date.parse(b.trakt_listed_at || '') || 0;
+                    return tb - ta;
+                });
+
+                return enrichAll(classified).then(function (enriched) {
+                    try {
+                        var withPoster = 0;
+                        for (var i = 0; i < enriched.length; i++) if (enriched[i].poster) withPoster++;
+                        console.log('[trakt_v2] tmdb enriched: with_poster=' + withPoster + '/' + enriched.length);
+                    } catch (_) {}
+                    return enriched;
+                });
             });
         });
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // Activity component (через Lampa.InteractionCategory — стандартная страница каталога)
+    // Activity component
     // ────────────────────────────────────────────────────────────────────
     function MainComponent(object) {
         var comp = new Lampa.InteractionCategory(object);
@@ -313,12 +405,9 @@
                 self.empty(Lampa.Lang.translate('trakt_v2_no_token'));
                 return;
             }
-            fetchWatchlist()
+            fetchAll()
                 .then(function (results) {
-                    self.build({
-                        results: results,
-                        total_pages: 1
-                    });
+                    self.build({ results: results, total_pages: 1 });
                     if (self.activity && self.activity.scroll) {
                         self.activity.scroll.onEnd = function () {};
                     }
@@ -333,15 +422,10 @@
 
         comp.next = function () { /* no pagination on Phase 1 */ };
 
-        // Переопределяем onEnter каждой карточки. Без этого Lampa использует
-        // дефолтный обработчик, который игнорирует наш method и дёргает TMDB
-        // как /movie/<id>/... даже для сериалов. См. memory: reference_lampa_card_api.
+        // Переопределяем onEnter каждой карточки. См. memory: reference_lampa_card_api.
         comp.cardRender = function (object, element, card) {
             card.onMenu = false;
             card.onEnter = function () {
-                // НЕ передаём `card` (инстанс Lampa.Card) — у него циклическая
-                // ссылка card → activity → component → activity, и JSON.stringify
-                // в Lampa.Activity.push падает на clone$1.
                 Lampa.Activity.push({
                     url: '',
                     component: 'full',
