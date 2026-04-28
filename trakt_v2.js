@@ -34,6 +34,22 @@
  * WL=true карточки независимо от статуса. Регистрация 5 пунктов в
  * Lampa.Manifest.plugins; tap-обработчики по матрице из reference_v2_data_model.md.
  *
+ * v0.1.8: state-aware sidebar labels + render-fix дублей.
+ *  - Lampa-обёртка плагинов выкидывает поля checkbox/collect/checked/selected
+ *    из onContextMenu return (проверено пробником) — нативные галочки доступны
+ *    только нативным группам «Избранное»/«Статус», которые мы НЕ используем.
+ *    Состояние выражаем через Unicode-маркер прямо в plugin.name, обновляя
+ *    его динамически через Lampa.Listener.follow('full'):
+ *      ☐ Watchlist  / ☑ Watchlist           (toggle, всегда виден чекбокс)
+ *      Progress     / ✓ Progress             (single-select, ✓ только у активного)
+ *    Дефолт без префикса для статусов / пустой чекбокс для Watchlist —
+ *    пока карточки не открыто, состояние не релевантно.
+ *  - Фикс 0.1.7: при попадании карточки в два ряда (WL + status) клонируем
+ *    card-data в buildSections (Object.assign({}, c)). Без клонирования
+ *    Lampa.Card мутировал общий объект и второй ряд молча терял карточку
+ *    (наблюдалось: tap WL на показ в Progress → визуально пропадал из Progress,
+ *    хотя классификатор оставлял его там).
+ *
  * Архитектура: см. SPEC_v2.md §«Раскладка экрана»
  * Зависимости: Lampa runtime; токен Trakt берётся из Lampa.Storage (выпускается плагином trakt_by_LME)
  * Прокси Trakt API: https://apx.lme.isroot.in/trakt
@@ -42,7 +58,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '0.1.7';
+    var VERSION = '0.1.8';
     try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
@@ -652,11 +668,19 @@
             //  - watchlist — все карточки с trakt_watchlist=true (независимо от статуса);
             //    дубли с рядом статуса допустимы и осмысленны.
             //  - остальные ряды — по trakt_status.
+            //
+            // ВАЖНО: при пуше в два ряда клонируем объект (Object.assign({}, c)).
+            // Иначе Lampa.Card мутирует общий card-data при первом рендере,
+            // и второй ряд видит «занятую» карточку и не отображает её
+            // (бага замечена в 0.1.7: tap WL на показ в Progress → визуально
+            // карточка пропадала из Progress, хотя классификатор оставлял её там).
+            // LAST_RESULTS остаётся с оригиналами — sidebar handler через
+            // findInCache читает корректное состояние.
             var bystatus = { watchlist: [], progress: [], finished: [], upcoming: [], dropped: [] };
             for (var i = 0; i < results.length; i++) {
                 var c = results[i];
-                if (c.trakt_watchlist) bystatus.watchlist.push(c);
-                if (c.trakt_status && bystatus[c.trakt_status]) bystatus[c.trakt_status].push(c);
+                if (c.trakt_watchlist) bystatus.watchlist.push(Object.assign({}, c));
+                if (c.trakt_status && bystatus[c.trakt_status]) bystatus[c.trakt_status].push(Object.assign({}, c));
             }
 
             // Создаём по InteractionLine на каждый ряд (пусто — заглушка с заголовком)
@@ -908,6 +932,42 @@
         return Promise.resolve();
     }
 
+    // Формирует label для пункта сайдбара по action и состоянию карточки.
+    // Если object не передан / нет в кеше — берётся «дефолтный» вид:
+    //   Watchlist всегда показывает рамку чекбокса (☐), статусы — без маркера.
+    function labelFor(action, object) {
+        var label = statusLabel(action);
+        var card = object ? resolveCard(object) : null;
+        if (action === 'watchlist') {
+            return (card && card.trakt_watchlist ? '☑ ' : '☐ ') + label;
+        }
+        var statusKey = STATUS[action.toUpperCase()];
+        if (card && card.trakt_status === statusKey) return '✓ ' + label;
+        return label;
+    }
+
+    // Обновляет outer name каждой нашей записи в Lampa.Manifest.plugins
+    // на основе состояния карточки. Lampa использует именно outer plugin.name
+    // как title пункта в action-сайдбаре (поля от onContextMenu выкидываются —
+    // см. v0.1.8 в шапке). Поэтому состояние «приклеиваем» к name динамически
+    // на каждое открытие full-card view.
+    function updateSidebarLabels(object) {
+        if (!window.Lampa || !Lampa.Manifest || !Array.isArray(Lampa.Manifest.plugins)) return;
+        try {
+            var labels = {};
+            SIDEBAR_ORDER.forEach(function (a) { labels[a] = labelFor(a, object); });
+            for (var i = 0; i < Lampa.Manifest.plugins.length; i++) {
+                var entry = Lampa.Manifest.plugins[i];
+                if (!entry || typeof entry.__trakt_v2 !== 'string') continue;
+                var action = entry.__trakt_v2.replace(/^trakt_v2:/, '');
+                if (labels.hasOwnProperty(action)) entry.name = labels[action];
+            }
+            try { console.log('[trakt_v2] sidebar labels updated:', JSON.stringify(labels)); } catch (_) {}
+        } catch (e) {
+            try { console.warn('[trakt_v2] updateSidebarLabels failed', e); } catch (_) {}
+        }
+    }
+
     // Регистрация 5 пунктов в нативном сайдбаре карточки. Защитный extend массива
     // — не перетираем существующие entries (например trakt_by_LME).
     function registerCardSidebar() {
@@ -921,8 +981,14 @@
             Lampa.Manifest.plugins.push({
                 __trakt_v2: marker,
                 type: 'video',
-                name: 'Trakt v2: ' + statusLabel(action),
-                onContextMenu: function () { return { name: statusLabel(action) }; },
+                // Дефолтное name (без open карточки). updateSidebarLabels мутирует
+                // его при каждом открытии full-card view — это и есть наш способ
+                // отразить состояние, потому что Lampa берёт title пункта именно
+                // из outer plugin.name, а не из onContextMenu return.
+                name: labelFor(action),
+                // Defensive: всё равно отдаём актуальный label из onContextMenu,
+                // на случай если в каких-то режимах Lampa всё-таки заглядывает сюда.
+                onContextMenu: function (object) { return { name: labelFor(action, object) }; },
                 onContextLauch: function (object) { handleSidebarTap(action, object); }
             });
         });
@@ -972,6 +1038,28 @@
         registerLang();
         Lampa.Component.add(COMPONENT, MainComponent);
         registerCardSidebar();
+
+        // Hook: на каждое открытие full-card view обновляем outer plugin.name
+        // у наших 5 entries — приклеиваем Unicode-маркер по состоянию из кеша.
+        // Lampa дёргает несколько событий ('build'/'complite'/...); реагируем
+        // на любое с card-данными — updateSidebarLabels идемпотентен.
+        try {
+            Lampa.Listener.follow('full', function (e) {
+                if (!e) return;
+                try {
+                    console.log('[trakt_v2] full event type=', e.type,
+                                'keys=', Object.keys(e || {}).join(','));
+                } catch (_) {}
+                var card = (e.data && (e.data.movie || e.data.card)) || e.movie || e.card || e.data;
+                if (!card) return;
+                var tmdb = card && (card.id || (card.ids && card.ids.tmdb));
+                if (!tmdb) return;
+                try { console.log('[trakt_v2] full card.tmdb=', tmdb); } catch (_) {}
+                updateSidebarLabels(card);
+            });
+        } catch (e) {
+            try { console.warn('[trakt_v2] full listener install failed', e); } catch (_) {}
+        }
 
         if (window.appready) {
             injectMenuItem();
