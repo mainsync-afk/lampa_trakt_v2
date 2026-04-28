@@ -16,8 +16,16 @@
  * которые переключают controller на соседний ряд через .toggle();
  * onLeft с самого левого края → выход в меню; onToggle синхронизирует
  * outer вертикальный scroll и триггерит lazy-load постеров через
- * scroll.update. Якорная панель (bookmarks-folder со счётчиками) +
- * sub-grouping movies/tv — следующие итерации.
+ * scroll.update.
+ *
+ * v0.1.6: вернули тонкий 'content' controller — НО с делегацией на
+ * lastFocused.toggle() в его toggle(), без своих left/right/up/down
+ * на активном слое. Это нужно для возврата фокуса из menu/head в активити:
+ * фреймворк делает Controller.toggle('content') и наш content сразу
+ * пере-активирует items_line. Постеры — теперь руками выпускаем
+ * 'visible' event на каждой линии после монтажа, что триггерит
+ * InteractionLine.visible() → Layer.visible(scroll.render) → lazy-load
+ * картинок без необходимости прокрутки.
  *
  * Архитектура: см. SPEC_v2.md §«Раскладка экрана»
  * Зависимости: Lampa runtime; токен Trakt берётся из Lampa.Storage (выпускается плагином trakt_by_lampame)
@@ -27,7 +35,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '0.1.5';
+    var VERSION = '0.1.6';
     try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
@@ -411,7 +419,7 @@
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // Activity component — v0.1.5: 5 секций через Lampa.InteractionLine
+    // Activity component — v0.1.6: 5 секций через Lampa.InteractionLine
     // ────────────────────────────────────────────────────────────────────
     //
     // Архитектура:
@@ -425,6 +433,11 @@
     //   слой; переключение фокуса между рядами осуществляется простым
     //   вызовом prevLine.toggle()/nextLine.toggle() из onUp/onDown текущего
     //   ряда. Outer Scroll слушает onToggle ряда и подтягивает viewport.
+    //   Контроллер 'content' зарегистрирован как тонкий entry-point —
+    //   его toggle() делегирует на lastFocused.toggle(), и сразу же
+    //   активным становится 'items_line'. Это нужно, чтобы фреймворк
+    //   мог вернуть фокус в активити по Controller.toggle('content')
+    //   (триггерится из menu и head при возврате).
     //
     // Якорная строка (bookmarks-folder со счётчиками) — следующая итерация.
 
@@ -574,6 +587,19 @@
 
                 if (self.activity) self.activity.loader(false);
 
+                // v0.1.6: триггерим 'visible' на каждой линии, чтобы InteractionLine.visible()
+                // вызвал Layer.visible(scroll) и постеры подгрузились без необходимости
+                // прокрутки. Нативный экран получает этот event автоматически когда outer
+                // scroll-mask видит элемент; у нас же на initial mount никто его не выпускает.
+                lines.forEach(function (line) {
+                    try {
+                        var el = line.render(true);
+                        if (el && typeof el.dispatchEvent === 'function') {
+                            el.dispatchEvent(new Event('visible'));
+                        }
+                    } catch (_) {}
+                });
+
                 // Если активити уже отрендерена и ждёт нас — сразу включаемся
                 if (self.activity && typeof self.activity.toggle === 'function') {
                     self.activity.toggle();
@@ -601,19 +627,44 @@
         this.start = function () {
             if (this.activity) this.activity.loader(false);
 
-            // v0.1.5: больше не регистрируем outer 'content' controller —
-            // он конфликтовал с встроенным `items_line` controller'ом,
-            // который InteractionLine регистрирует сам в .toggle().
-            // Просто активируем последнюю фокусированную линию (если есть)
-            // или первую — она зарегистрирует и переключит controller сама.
-            var target = lastFocused || lines[0] || null;
-            if (target) {
-                target.toggle();
-            } else {
-                // Нет ни одной непустой секции (всё пусто/нет токена/etc.) —
-                // оставляем "head" controller активным, чтобы не лочить интерфейс.
-                Lampa.Controller.toggle('head');
-            }
+            // v0.1.6: тонкий 'content' controller. Сам он не держит фокус;
+            // его toggle() сразу делегирует на активный ряд (lastFocused
+            // или lines[0]), который через свой .toggle() переключит
+            // активный controller на 'items_line'. Это нужно, чтобы возврат
+            // в активити из menu/head (фреймворк делает Controller.toggle('content'))
+            // корректно отрабатывал. left/right/up/down/back на этом слое
+            // — fallback'и, в реальной работе они не должны вызываться,
+            // потому что после toggle активным становится items_line.
+            Lampa.Controller.add('content', {
+                link: self,
+                toggle: function () {
+                    var target = lastFocused || lines[0] || null;
+                    if (target) {
+                        target.toggle();
+                    }
+                    // если ни одной линии нет — оставляем head активным
+                    // (этот случай — пустые секции / нет токена / fetch error)
+                    else {
+                        Lampa.Controller.toggle('head');
+                    }
+                },
+                left: function () {
+                    if (Navigator.canmove('left')) Navigator.move('left');
+                    else Lampa.Controller.toggle('menu');
+                },
+                right: function () {
+                    if (Navigator.canmove('right')) Navigator.move('right');
+                },
+                up: function () {
+                    if (Navigator.canmove('up')) Navigator.move('up');
+                    else Lampa.Controller.toggle('head');
+                },
+                down: function () {
+                    if (Navigator.canmove('down')) Navigator.move('down');
+                },
+                back: this.back
+            });
+            Lampa.Controller.toggle('content');
         };
 
         this.back = function () {
