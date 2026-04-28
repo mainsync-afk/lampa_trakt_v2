@@ -54,6 +54,14 @@
  *    стрелял слишком поздно (или не на ту фазу — не выяснили).
  *  - Удалены: updateSidebarLabels, Listener.follow('full') (мёртвый код).
  *
+ * v0.1.14: фикс имени Lampa-section для Settings.
+ *  - В v0.1.13 регистрировали addParam под component:'trakttv' (как было
+ *    в v1). В LME-форке trakt_by_LME секцию переименовали в 'trakt' (см.
+ *    trakt_by_LME.js:6698 addComponent({component:'trakt'})). Без правильного
+ *    имени addParam silently ничего не делает — пункт не появлялся.
+ *  - Поменяли component на 'trakt'. Лог-маркер тоже: '[trakt_v2] settings
+ *    registered (trakt component, ...)' (раньше '(trakttv component, ...)').
+ *
  * v0.1.13: Custom list для Dropped + Settings UI; ушли от hpw полностью.
  *  - Backlog #7 закрыт частично. Раньше: Dropped писали в hpw + hdr (двойник
  *    под видом «триплета»), для movies был notify «not yet supported».
@@ -66,7 +74,9 @@
  *  - Канонизация v1 (fire-and-forget POST в недостающие ячейки с throttle)
  *    отложена — без hpw она нужна только между hdr и list, и вопрос как
  *    себя ведут другие клиенты ещё не закрыт.
- *  - Settings: Lampa.SettingsApi.addParam под component:'trakttv' (как v1).
+ *  - Settings: Lampa.SettingsApi.addParam под component:'trakt' (имя секции
+ *    trakt_by_LME — был 'trakttv' в старом trakt_by_lampame, в LME форке
+ *    переименовали в 'trakt', см. trakt_by_LME.js:6698).
  *    Тип select с values из cached lists. fetchUserLists() вызывается в
  *    start() для refresh кеша (если есть токен).
  *  - droppedTmdb теперь type-aware — keyed по 'show:<tmdb>' / 'movie:<tmdb>'.
@@ -135,7 +145,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '0.1.13';
+    var VERSION = '0.1.14';
     try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
@@ -1425,8 +1435,9 @@
     // ────────────────────────────────────────────────────────────────────
     // Lampa SettingsApi: селектор кастомного листа Dropped
     // ────────────────────────────────────────────────────────────────────
-    // Регистрируемся под component:'trakttv' (раздел от trakt_by_LME) — паттерн
-    // v1 (см. memory reference_v1_type_resolution.md / project_v2_native_folders_removal.md).
+    // Регистрируемся под component:'trakt' (раздел от trakt_by_LME, см.
+    // trakt_by_LME.js:6698 — он первым делает addComponent с этим именем).
+    // У v1 trakt_by_lampame использовал 'trakttv', в LME-форке переименовали.
     // Свой component через addComponent в v1 оказался нестабильным, не пытаемся.
     function registerSettings() {
         if (!window.Lampa || !Lampa.SettingsApi || typeof Lampa.SettingsApi.addParam !== 'function') return;
@@ -1435,8 +1446,11 @@
             getCachedLists().forEach(function (l) {
                 if (l && l.id) values[String(l.id)] = String(l.name || ('list ' + l.id));
             });
+            // trakt_by_LME регистрирует свой section как component:'trakt'
+            // (см. trakt_by_LME.js:6698 addComponent). Раньше в v1 был 'trakttv',
+            // в LME-форке переименовали.
             Lampa.SettingsApi.addParam({
-                component: 'trakttv',
+                component: 'trakt',
                 param: {
                     name: STORAGE_DROPPED_LIST_ID,
                     type: 'select',
@@ -1451,7 +1465,7 @@
                                  'Список тянется при старте плагина — если только что создали, перезагрузите страницу.'
                 }
             });
-            try { console.log('[trakt_v2] settings registered (trakttv component, param=' + STORAGE_DROPPED_LIST_ID + ', cached_lists=' + (Object.keys(values).length - 1) + ')'); } catch (_) {}
+            try { console.log('[trakt_v2] settings registered (trakt component, param=' + STORAGE_DROPPED_LIST_ID + ', cached_lists=' + (Object.keys(values).length - 1) + ')'); } catch (_) {}
         } catch (e) {
             try { console.warn('[trakt_v2] registerSettings failed', e); } catch (_) {}
         }
