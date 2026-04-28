@@ -8,10 +8,16 @@
  * нативного экрана «Избранное» (компонент `bookmarks`). Outer Lampa.Scroll
  * (vertical, mask:true, over:true) + 5 × Lampa.InteractionLine. Карточки
  * стандартные (через встроенный path InteractionLine → new Lampa.Card).
- * Каждый InteractionLine сам управляет horizontal scroll и регистрирует
- * controller `items_line`; outer controller `content` переключает между
- * рядами через Navigator. Якорная панель (bookmarks-folder со счётчиками)
- * — отдельная итерация v0.1.5.
+ *
+ * v0.1.5: фикс D-pad навигации. Убран outer Controller.add('content') —
+ * он конфликтовал с встроенным `items_line` controller InteractionLine
+ * (нативный bookmarks тоже использует только `items_line`). Активация
+ * первой линии через lines[0].toggle(); каждой линии заданы onUp/onDown,
+ * которые переключают controller на соседний ряд через .toggle();
+ * onLeft с самого левого края → выход в меню; onToggle синхронизирует
+ * outer вертикальный scroll и триггерит lazy-load постеров через
+ * scroll.update. Якорная панель (bookmarks-folder со счётчиками) +
+ * sub-grouping movies/tv — следующие итерации.
  *
  * Архитектура: см. SPEC_v2.md §«Раскладка экрана»
  * Зависимости: Lampa runtime; токен Trakt берётся из Lampa.Storage (выпускается плагином trakt_by_lampame)
@@ -21,7 +27,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '0.1.4';
+    var VERSION = '0.1.5';
     try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
@@ -405,16 +411,20 @@
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // Activity component — v0.1.4: 5 секций через Lampa.InteractionLine
+    // Activity component — v0.1.5: 5 секций через Lampa.InteractionLine
     // ────────────────────────────────────────────────────────────────────
     //
     // Архитектура:
-    //   outer  → Lampa.Scroll({mask:true, over:true})
+    //   outer  → Lampa.Scroll({mask:true, over:true}) — только вертикальный
+    //            "viewport" со scroll-mask, без своего controller.
     //   inside →  5 × Lampa.InteractionLine — по одной на статус
     //              (Watchlist/Progress/Finished/Upcoming/Dropped).
     //   каждый  InteractionLine сам управляет horizontal scroll и
-    //   регистрирует controller 'items_line' (см. ресёрч лога 1777353372098).
-    //   outer controller 'content' переключает между рядами через Navigator.
+    //   регистрирует controller 'items_line' (см. ресёрч лога 1777353372098)
+    //   при вызове .toggle(). Один InteractionLine == один controller-овский
+    //   слой; переключение фокуса между рядами осуществляется простым
+    //   вызовом prevLine.toggle()/nextLine.toggle() из onUp/onDown текущего
+    //   ряда. Outer Scroll слушает onToggle ряда и подтягивает viewport.
     //
     // Якорная строка (bookmarks-folder со счётчиками) — следующая итерация.
 
@@ -435,7 +445,7 @@
         var html = $('<div class="trakt_v2"></div>');
         var body = $('<div class="trakt_v2__body"></div>');
         var lines = [];          // массив Lampa.InteractionLine
-        var lastFocused = null;  // последняя активная карточка для toggle()
+        var lastFocused = null;  // последняя активная линия для toggle()
 
         this.activity = null;
 
@@ -454,10 +464,10 @@
             var line = new Lampa.InteractionLine(data, params);
             line.create();
 
-            // Перехват onFocus, чтобы запоминать последнюю карточку и обновлять outer scroll
+            // Перехват onFocus: запомнить ряд и подтянуть outer scroll
+            // (на случай первичного входа без onToggle).
             line.onFocus = function (card_data) {
-                lastFocused = line.render(true);
-                // Обновим вертикальный outer scroll, чтобы текущий ряд был виден
+                lastFocused = line;
                 try { scroll.update($(line.render(true)), true); } catch (_) {}
             };
 
@@ -473,16 +483,36 @@
                 });
             };
 
-            // onUp/onDown — InteractionLine их вызывает, если Navigator.canmove не помог.
-            // Дадим стандартное поведение: возврат к outer controller, который сам разберётся.
+            // Переключение между рядами: ищем индекс себя в массиве lines динамически
+            // (он ещё не зафиксирован в момент создания — buildSections добавляет ряды
+            // последовательно, поэтому считаем индекс в момент события).
             line.onUp = function () {
-                if (Navigator.canmove('up')) Navigator.move('up');
+                var idx = lines.indexOf(line);
+                var prev = idx > 0 ? lines[idx - 1] : null;
+                if (prev) prev.toggle();
                 else Lampa.Controller.toggle('head');
             };
             line.onDown = function () {
-                if (Navigator.canmove('down')) Navigator.move('down');
+                var idx = lines.indexOf(line);
+                var next = idx >= 0 && idx < lines.length - 1 ? lines[idx + 1] : null;
+                if (next) next.toggle();
+                // если ряд последний — оставляем фокус на месте
+            };
+            line.onLeft = function () {
+                // Когда внутри ряда уже нельзя двигаться влево — выходим в левое меню.
+                Lampa.Controller.toggle('menu');
             };
             line.onBack = self.back;
+
+            // onToggle вызывается InteractionLine при активации controller'а (см. источник
+            // create$1 в reference_lampa_native_bookmarks_layout.md). Используем для
+            // синхронизации outer вертикального scroll и триггера lazy-load постеров —
+            // scroll.update триггерит scroll-event у inner horizontal scroll, что
+            // вызывает Layer.visible проверки.
+            line.onToggle = function () {
+                lastFocused = line;
+                try { scroll.update($(line.render(true)), true); } catch (_) {}
+            };
 
             return line;
         }
@@ -571,33 +601,19 @@
         this.start = function () {
             if (this.activity) this.activity.loader(false);
 
-            Lampa.Controller.add('content', {
-                link: this,
-                toggle: function () {
-                    Lampa.Controller.collectionSet(scroll.render());
-                    var firstCard;
-                    if (lastFocused) firstCard = lastFocused;
-                    else if (lines[0]) firstCard = lines[0].render(true);
-                    else firstCard = scroll.render().find('.selector').get(0);
-                    Lampa.Controller.collectionFocus(firstCard || false, scroll.render());
-                },
-                left: function () {
-                    if (Navigator.canmove('left')) Navigator.move('left');
-                    else Lampa.Controller.toggle('menu');
-                },
-                right: function () {
-                    if (Navigator.canmove('right')) Navigator.move('right');
-                },
-                up: function () {
-                    if (Navigator.canmove('up')) Navigator.move('up');
-                    else Lampa.Controller.toggle('head');
-                },
-                down: function () {
-                    if (Navigator.canmove('down')) Navigator.move('down');
-                },
-                back: this.back
-            });
-            Lampa.Controller.toggle('content');
+            // v0.1.5: больше не регистрируем outer 'content' controller —
+            // он конфликтовал с встроенным `items_line` controller'ом,
+            // который InteractionLine регистрирует сам в .toggle().
+            // Просто активируем последнюю фокусированную линию (если есть)
+            // или первую — она зарегистрирует и переключит controller сама.
+            var target = lastFocused || lines[0] || null;
+            if (target) {
+                target.toggle();
+            } else {
+                // Нет ни одной непустой секции (всё пусто/нет токена/etc.) —
+                // оставляем "head" controller активным, чтобы не лочить интерфейс.
+                Lampa.Controller.toggle('head');
+            }
         };
 
         this.back = function () {
