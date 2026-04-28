@@ -35,7 +35,7 @@
  * Lampa.Manifest.plugins; tap-обработчики по матрице из reference_v2_data_model.md.
  *
  * Архитектура: см. SPEC_v2.md §«Раскладка экрана»
- * Зависимости: Lampa runtime; токен Trakt берётся из Lampa.Storage (выпускается плагином trakt_by_lampame)
+ * Зависимости: Lampa runtime; токен Trakt берётся из Lampa.Storage (выпускается плагином trakt_by_LME)
  * Прокси Trakt API: https://apx.lme.isroot.in/trakt
  * TMDB API: https://api.themoviedb.org/3 (прямой, тот же ключ что у ядра Lampa)
  */
@@ -909,7 +909,7 @@
     }
 
     // Регистрация 5 пунктов в нативном сайдбаре карточки. Защитный extend массива
-    // — не перетираем существующие entries (например trakt_by_lampame).
+    // — не перетираем существующие entries (например trakt_by_LME).
     function registerCardSidebar() {
         if (!window.Lampa || !Lampa.Manifest) return;
         if (!Array.isArray(Lampa.Manifest.plugins)) Lampa.Manifest.plugins = [];
