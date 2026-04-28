@@ -54,6 +54,24 @@
  *    стрелял слишком поздно (или не на ту фазу — не выяснили).
  *  - Удалены: updateSidebarLabels, Listener.follow('full') (мёртвый код).
  *
+ * v0.1.11: оптимистичное обновление кеша вместо Activity.replace.
+ *  - Раньше после каждого write-action делали refreshScreenIfActive() →
+ *    Lampa.Activity.replace() → весь экран пересобирался: новый fetchAll,
+ *    ребилд 5 рядов, потеря фокуса. Юзер видел дёргающийся рефреш.
+ *  - В нативной папке refreshScreenIfActive ничего не делал (мы не на нашем
+ *    component) → LAST_RESULTS оставался stale → следующий long-press на
+ *    той же карточке показывал старое состояние до повторного захода в нашу
+ *    папку.
+ *  - Решение: применить мутацию к карточке в LAST_RESULTS in-place по матрице
+ *    действия (или добавить минимальную запись если карточки в кеше нет).
+ *    Активити больше не дёргается. Сайдбар на той же карточке сразу
+ *    показывает новое состояние через капчер-hook + labelFor → findInCache.
+ *  - Trade-off: ряды на нашей странице НЕ реорганизуются мгновенно — карточки
+ *    переезжают между рядами только на следующем заходе в папку. Это backlog
+ *    item (DOM-уровень обновление без Activity.replace).
+ *  - refreshScreenIfActive() оставлен как dead code на случай ручной кнопки
+ *    «обновить» в будущих версиях.
+ *
  * v0.1.10: state-aware sidebar labels — рабочая реализация через hover:long
  * capture-phase hook (после изучения src/interaction/card.js в lampa-source).
  *  - Card.onMenu в Lampa строит action-сайдбар на DOM event 'hover:long'
@@ -82,7 +100,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '0.1.10';
+    var VERSION = '0.1.11';
     try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
@@ -872,6 +890,9 @@
     function notify(text) {
         try { Lampa.Noty.show(String(text || '')); } catch (_) {}
     }
+    // Оставлен как dead code на случай ручной кнопки «обновить» в будущем.
+    // С v0.1.11 НЕ вызывается из handleSidebarTap — заменён на
+    // applyOptimisticUpdate (мутация LAST_RESULTS in-place без рефреша экрана).
     function refreshScreenIfActive() {
         try {
             var act = Lampa.Activity.active();
@@ -881,6 +902,82 @@
                     component: COMPONENT, page: 1
                 });
             }
+        } catch (_) {}
+    }
+
+    // Гарантирует наличие карточки в LAST_RESULTS. Если её там не было
+    // (например, юзер таппает в нативной папке на карточке, которой нет
+    // в нашем кеше) — добавляет минимальную запись с trakt_ids/trakt_type
+    // и нулевыми флажками. Возвращает ссылку на запись в кеше.
+    function ensureInCache(card) {
+        if (!card || !card.trakt_ids) return null;
+        var tmdbId = card.trakt_ids.tmdb;
+        if (!tmdbId) return null;
+        var type = card.trakt_type;
+        var cached = findInCache(tmdbId, type);
+        if (cached) return cached;
+        cached = {
+            trakt_type: type,
+            trakt_ids: { tmdb: tmdbId },
+            trakt_status: null,
+            trakt_watchlist: false,
+            _trakt_progress_seasons: card._trakt_progress_seasons || null
+        };
+        LAST_RESULTS.push(cached);
+        return cached;
+    }
+
+    // Оптимистичное обновление LAST_RESULTS после успешного write-action.
+    // Не дёргает экран — следующий open сайдбара на той же карточке через
+    // labelFor → findInCache увидит свежее состояние. Полный fetchAll
+    // случится на следующем заходе в папку и сверит/исправит при
+    // необходимости. Логика — по матрице из reference_v2_data_model.md.
+    function applyOptimisticUpdate(action, card) {
+        var c = ensureInCache(card);
+        if (!c) return;
+        var oldStatus = c.trakt_status;
+        var type = c.trakt_type;
+
+        if (action === 'watchlist') {
+            c.trakt_watchlist = !c.trakt_watchlist;
+        }
+        else if (action === 'finished') {
+            if (type === 'movie') {
+                if (oldStatus === STATUS.FINISHED) {
+                    c.trakt_status = null;          // unset → None
+                } else {
+                    c.trakt_status = STATUS.FINISHED;
+                    c.trakt_watchlist = false;      // auto-снятие WL по матрице
+                }
+            } else {
+                // show: handler не вызывает нас при UPCOMING/FINISHED (там noop),
+                // т.е. сюда попадаем только при None/Progress/Dropped → set FINISHED.
+                // Реальное состояние может оказаться UPCOMING (если есть невышедшие
+                // эпизоды) — следующий fetchAll скорректирует.
+                c.trakt_status = STATUS.FINISHED;
+                c.trakt_watchlist = false;
+            }
+        }
+        else if (action === 'dropped') {
+            if (type === 'movie') {
+                // Movies dropped в текущей версии не поддерживаем (backlog #7) —
+                // handler возвращает раньше, сюда не попадаем.
+                return;
+            }
+            if (oldStatus === STATUS.DROPPED) {
+                c.trakt_status = null;              // unset → reclassify на след. fetch
+            } else {
+                c.trakt_status = STATUS.DROPPED;
+                c.trakt_watchlist = false;
+            }
+        }
+        // progress / upcoming — noop в handler, сюда не попадаем.
+
+        try {
+            console.log('[trakt_v2] cache updated after', action,
+                        'tmdb=', c.trakt_ids.tmdb,
+                        'status=', c.trakt_status,
+                        'wl=', c.trakt_watchlist);
         } catch (_) {}
     }
     function resolveCard(object) {
@@ -904,8 +1001,8 @@
         if (action === 'watchlist') {
             var p = wl ? postWatchlistRemove(card) : postWatchlistAdd(card);
             return p.then(function () {
+                applyOptimisticUpdate(action, card);
                 notify(wl ? 'Watchlist: removed' : 'Watchlist: added');
-                refreshScreenIfActive();
             }).catch(function (err) {
                 try { console.warn('[trakt_v2] watchlist tap failed', err); } catch (_) {}
                 notify(Lampa.Lang.translate('trakt_v2_load_error'));
@@ -919,7 +1016,7 @@
             if (type === 'movie') {
                 if (status === STATUS.FINISHED) {
                     return postHistoryRemoveMovie(card)
-                        .then(function () { notify('Finished: removed'); refreshScreenIfActive(); })
+                        .then(function () { applyOptimisticUpdate(action, card); notify('Finished: removed'); })
                         .catch(function (err) { try { console.warn('[trakt_v2] finished remove failed', err); } catch (_) {} notify(Lampa.Lang.translate('trakt_v2_load_error')); });
                 }
                 var ops = [];
@@ -927,7 +1024,7 @@
                 ops.push(postHistoryAddMovie(card));
                 if (wl) ops.push(postWatchlistRemove(card).catch(function () { return null; }));
                 return Promise.all(ops)
-                    .then(function () { notify('Finished: added'); refreshScreenIfActive(); })
+                    .then(function () { applyOptimisticUpdate(action, card); notify('Finished: added'); })
                     .catch(function (err) { try { console.warn('[trakt_v2] finished add failed', err); } catch (_) {} notify(Lampa.Lang.translate('trakt_v2_load_error')); });
             }
             // show
@@ -937,7 +1034,7 @@
             sops.push(postHistoryAddShow(card));
             if (wl) sops.push(postWatchlistRemove(card).catch(function () { return null; }));
             return Promise.all(sops)
-                .then(function () { notify('Finished: added'); refreshScreenIfActive(); })
+                .then(function () { applyOptimisticUpdate(action, card); notify('Finished: added'); })
                 .catch(function (err) {
                     try { console.warn('[trakt_v2] finished show add failed', err); } catch (_) {}
                     if (err && err.code === 'no_progress_seasons') notify('Finished: open card first to load episodes');
@@ -952,13 +1049,13 @@
             }
             if (status === STATUS.DROPPED) {
                 return postHiddenRemoveTriple(card)
-                    .then(function () { notify('Dropped: removed'); refreshScreenIfActive(); })
+                    .then(function () { applyOptimisticUpdate(action, card); notify('Dropped: removed'); })
                     .catch(function (err) { try { console.warn('[trakt_v2] dropped remove failed', err); } catch (_) {} notify(Lampa.Lang.translate('trakt_v2_load_error')); });
             }
             var dops = [postHiddenAddTriple(card)];
             if (wl) dops.push(postWatchlistRemove(card).catch(function () { return null; }));
             return Promise.all(dops)
-                .then(function () { notify('Dropped: added'); refreshScreenIfActive(); })
+                .then(function () { applyOptimisticUpdate(action, card); notify('Dropped: added'); })
                 .catch(function (err) { try { console.warn('[trakt_v2] dropped add failed', err); } catch (_) {} notify(Lampa.Lang.translate('trakt_v2_load_error')); });
         }
         return Promise.resolve();
