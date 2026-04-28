@@ -34,21 +34,33 @@
  * WL=true карточки независимо от статуса. Регистрация 5 пунктов в
  * Lampa.Manifest.plugins; tap-обработчики по матрице из reference_v2_data_model.md.
  *
- * v0.1.8: state-aware sidebar labels + render-fix дублей.
+ * v0.1.8: state-aware sidebar labels (попытка через Listener.follow) + render-fix дублей.
  *  - Lampa-обёртка плагинов выкидывает поля checkbox/collect/checked/selected
  *    из onContextMenu return (проверено пробником) — нативные галочки доступны
  *    только нативным группам «Избранное»/«Статус», которые мы НЕ используем.
- *    Состояние выражаем через Unicode-маркер прямо в plugin.name, обновляя
- *    его динамически через Lampa.Listener.follow('full'):
- *      ☐ Watchlist  / ☑ Watchlist           (toggle, всегда виден чекбокс)
- *      Progress     / ✓ Progress             (single-select, ✓ только у активного)
- *    Дефолт без префикса для статусов / пустой чекбокс для Watchlist —
- *    пока карточки не открыто, состояние не релевантно.
+ *    Решено выражать состояние Unicode-маркером в plugin.name. Обновлять имя
+ *    пытались через Lampa.Listener.follow('full') — ОКАЗАЛОСЬ НЕ РАБОЧИМ:
+ *    long-press на карточке в нашей папке открывает action-сайдбар напрямую,
+ *    минуя full-card view, событие 'full' не дёргается.
  *  - Фикс 0.1.7: при попадании карточки в два ряда (WL + status) клонируем
  *    card-data в buildSections (Object.assign({}, c)). Без клонирования
- *    Lampa.Card мутировал общий объект и второй ряд молча терял карточку
- *    (наблюдалось: tap WL на показ в Progress → визуально пропадал из Progress,
- *    хотя классификатор оставлял его там).
+ *    Lampa.Card мутировал общий объект и второй ряд молча терял карточку.
+ *
+ * v0.1.9: state-aware sidebar labels — рабочая реализация.
+ *  - Заменили Listener.follow('full') на патч Lampa.Select.show. Когда меню
+ *    открывается с нашими пунктами (детектим по String(item.onSelect) c
+ *    подстрокой 'handleSidebarTap'), мутируем item.title для каждой нашей
+ *    записи на лету, до передачи в orig.show.
+ *  - Карточку, на которой стоит долгий тап, ловим через line.onFocus в нашей
+ *    MainComponent — последняя сфокусированная карточка хранится в
+ *    currentFocusedCard. На Path 2 (long-press в нашей папке) это работает,
+ *    т.к. курсор обязательно сначала попадает в onFocus. Для Path 3 (long-
+ *    press в нативной папке) currentFocusedCard будет stale/null — пункты
+ *    покажут default. Path 3 fix — отдельная задача.
+ *  - Удалены: updateSidebarLabels (больше не нужен), Listener.follow('full')
+ *    инсталляция (мёртвый код).
+ *  - Маркеры: ☐ Watchlist / ☑ Watchlist (toggle, всегда виден чекбокс),
+ *    Progress / ✓ Progress (single-select, ✓ только у активного).
  *
  * Архитектура: см. SPEC_v2.md §«Раскладка экрана»
  * Зависимости: Lampa runtime; токен Trakt берётся из Lampa.Storage (выпускается плагином trakt_by_LME)
@@ -58,7 +70,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '0.1.8';
+    var VERSION = '0.1.9';
     try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
@@ -360,6 +372,11 @@
 
     // Кеш результатов последнего fetchAll (для read-state в sidebar handler).
     var LAST_RESULTS = [];
+    // Последняя карточка, на которой стоял курсор в наших InteractionLine —
+    // именно её юзер «long-press»-ит, чтобы открыть action-сайдбар. Заполняется
+    // в line.onFocus (см. MainComponent.buildSectionLine), читается в
+    // rewriteOurItemTitles при патче Lampa.Select.show.
+    var currentFocusedCard = null;
     function findInCache(tmdbId, type) {
         if (!tmdbId) return null;
         var key = String(tmdbId);
@@ -611,9 +628,12 @@
             line.create();
 
             // Перехват onFocus: запомнить ряд и подтянуть outer scroll
-            // (на случай первичного входа без onToggle).
+            // (на случай первичного входа без onToggle). Также сохранить
+            // карточку как currentFocusedCard — она пригодится в патче
+            // Lampa.Select.show, когда юзер сделает long-press.
             line.onFocus = function (card_data) {
                 lastFocused = line;
+                if (card_data) currentFocusedCard = card_data;
                 try { scroll.update($(line.render(true)), true); } catch (_) {}
             };
 
@@ -946,26 +966,65 @@
         return label;
     }
 
-    // Обновляет outer name каждой нашей записи в Lampa.Manifest.plugins
-    // на основе состояния карточки. Lampa использует именно outer plugin.name
-    // как title пункта в action-сайдбаре (поля от onContextMenu выкидываются —
-    // см. v0.1.8 в шапке). Поэтому состояние «приклеиваем» к name динамически
-    // на каждое открытие full-card view.
-    function updateSidebarLabels(object) {
-        if (!window.Lampa || !Lampa.Manifest || !Array.isArray(Lampa.Manifest.plugins)) return;
-        try {
-            var labels = {};
-            SIDEBAR_ORDER.forEach(function (a) { labels[a] = labelFor(a, object); });
-            for (var i = 0; i < Lampa.Manifest.plugins.length; i++) {
-                var entry = Lampa.Manifest.plugins[i];
-                if (!entry || typeof entry.__trakt_v2 !== 'string') continue;
-                var action = entry.__trakt_v2.replace(/^trakt_v2:/, '');
-                if (labels.hasOwnProperty(action)) entry.name = labels[action];
-            }
-            try { console.log('[trakt_v2] sidebar labels updated:', JSON.stringify(labels)); } catch (_) {}
-        } catch (e) {
-            try { console.warn('[trakt_v2] updateSidebarLabels failed', e); } catch (_) {}
+    // Определяет, какому из наших action соответствует данный item.title.
+    // Раз Lampa читает title из outer plugin.name (=labelFor(action) с null
+    // карточкой при registerCardSidebar), у наших пунктов на момент открытия
+    // меню title строго один из 5 дефолтов. Если позже title уже мутировали
+    // и в нём есть префикс ☐/☑/✓ — снимаем префикс и сравниваем.
+    function ourActionFromTitle(title) {
+        if (typeof title !== 'string') return null;
+        var stripped = title.replace(/^[\u2610\u2611\u2713]\s/, ''); // ☐ ☑ ✓
+        for (var i = 0; i < SIDEBAR_ORDER.length; i++) {
+            if (statusLabel(SIDEBAR_ORDER[i]) === stripped) return SIDEBAR_ORDER[i];
         }
+        return null;
+    }
+
+    // Помечает наши пункты в готовом items-массиве правильным маркером
+    // на основе текущего currentFocusedCard. Идентификация пункта — по
+    // подстроке 'handleSidebarTap' в исходнике item.onSelect (Lampa оборачивает
+    // наш onContextLauch, но source оборачиваемой функции преобразуется в
+    // строку и содержит её тело).
+    function rewriteOurItemTitles(items, card) {
+        if (!Array.isArray(items)) return;
+        var updated = 0;
+        for (var i = 0; i < items.length; i++) {
+            var item = items[i];
+            if (!item || typeof item.onSelect !== 'function') continue;
+            var src = '';
+            try { src = String(item.onSelect); } catch (_) { continue; }
+            if (src.indexOf('handleSidebarTap') === -1) continue;
+            var action = ourActionFromTitle(item.title);
+            if (!action) continue;
+            item.title = labelFor(action, card);
+            updated++;
+        }
+        try {
+            console.log('[trakt_v2] rewriteOurItemTitles: updated=' + updated +
+                        ' currentCard.id=' + (card && (card.id || (card.ids && card.ids.tmdb))));
+        } catch (_) {}
+    }
+
+    // Патчит Lampa.Select.show один раз. Когда меню содержит наши пункты —
+    // мутируем их item.title по currentFocusedCard. Идемпотентно (проверяем
+    // флаг __trakt_v2_patched на новой функции).
+    function patchSelectShowForLabels() {
+        if (!Lampa.Select || typeof Lampa.Select.show !== 'function') return;
+        if (Lampa.Select.show.__trakt_v2_patched) return;
+        var orig = Lampa.Select.show;
+        var patched = function (params) {
+            try {
+                if (params && Array.isArray(params.items)) {
+                    rewriteOurItemTitles(params.items, currentFocusedCard);
+                }
+            } catch (e) {
+                try { console.warn('[trakt_v2] patchSelectShow err', e); } catch (_) {}
+            }
+            return orig.apply(this, arguments);
+        };
+        patched.__trakt_v2_patched = true;
+        Lampa.Select.show = patched;
+        try { console.log('[trakt_v2] Lampa.Select.show patched for label rewriting'); } catch (_) {}
     }
 
     // Регистрация 5 пунктов в нативном сайдбаре карточки. Защитный extend массива
@@ -1039,27 +1098,12 @@
         Lampa.Component.add(COMPONENT, MainComponent);
         registerCardSidebar();
 
-        // Hook: на каждое открытие full-card view обновляем outer plugin.name
-        // у наших 5 entries — приклеиваем Unicode-маркер по состоянию из кеша.
-        // Lampa дёргает несколько событий ('build'/'complite'/...); реагируем
-        // на любое с card-данными — updateSidebarLabels идемпотентен.
-        try {
-            Lampa.Listener.follow('full', function (e) {
-                if (!e) return;
-                try {
-                    console.log('[trakt_v2] full event type=', e.type,
-                                'keys=', Object.keys(e || {}).join(','));
-                } catch (_) {}
-                var card = (e.data && (e.data.movie || e.data.card)) || e.movie || e.card || e.data;
-                if (!card) return;
-                var tmdb = card && (card.id || (card.ids && card.ids.tmdb));
-                if (!tmdb) return;
-                try { console.log('[trakt_v2] full card.tmdb=', tmdb); } catch (_) {}
-                updateSidebarLabels(card);
-            });
-        } catch (e) {
-            try { console.warn('[trakt_v2] full listener install failed', e); } catch (_) {}
-        }
+        // Патч Lampa.Select.show: при открытии любого меню с нашими пунктами
+        // (детект — substring 'handleSidebarTap' в item.onSelect.toString())
+        // мутируем item.title под состояние currentFocusedCard. Это и есть
+        // механизм state-aware подписей для Path 2 (long-press в нашей папке).
+        // См. docblock v0.1.9 о причинах отказа от Listener.follow('full').
+        patchSelectShowForLabels();
 
         if (window.appready) {
             injectMenuItem();
