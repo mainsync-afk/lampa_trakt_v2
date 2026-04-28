@@ -54,6 +54,25 @@
  *    стрелял слишком поздно (или не на ту фазу — не выяснили).
  *  - Удалены: updateSidebarLabels, Listener.follow('full') (мёртвый код).
  *
+ * v0.1.13: Custom list для Dropped + Settings UI; ушли от hpw полностью.
+ *  - Backlog #7 закрыт частично. Раньше: Dropped писали в hpw + hdr (двойник
+ *    под видом «триплета»), для movies был notify «not yet supported».
+ *    Теперь: пишем в hdr + custom list; movies без листа недоступны (явный
+ *    notify «настройте папку Dropped в настройках»).
+ *  - hpw НЕ пишем и НЕ читаем (backlog #10): Moviebase пишет туда «Stop
+ *    watching» и не имеет UI для отмены — карточка залипает в hpw без
+ *    возможности её достать. Если бы мы тоже туда писали, наш «un-drop»
+ *    оставлял бы Moviebase-запись и UI был бы рассинхронизирован.
+ *  - Канонизация v1 (fire-and-forget POST в недостающие ячейки с throttle)
+ *    отложена — без hpw она нужна только между hdr и list, и вопрос как
+ *    себя ведут другие клиенты ещё не закрыт.
+ *  - Settings: Lampa.SettingsApi.addParam под component:'trakttv' (как v1).
+ *    Тип select с values из cached lists. fetchUserLists() вызывается в
+ *    start() для refresh кеша (если есть токен).
+ *  - droppedTmdb теперь type-aware — keyed по 'show:<tmdb>' / 'movie:<tmdb>'.
+ *    Раньше было keyed по tmdb only (хватало, потому что hpw/hdr только
+ *    shows); теперь list возвращает оба типа, нужна типобезопасность.
+ *
  * v0.1.12: detectCardType — фикс мис-определения типа карточки в нативных папках.
  *  - Был баг: long-press на сериале в нативной папке (trending/movies/shows)
  *    → resolveCard возвращал 'movie' (потому что Lampa-нативные карточки не
@@ -116,12 +135,18 @@
 (function () {
     'use strict';
 
-    var VERSION = '0.1.12';
+    var VERSION = '0.1.13';
     try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
     var API_URL = 'https://apx.lme.isroot.in/trakt';
     var STORAGE_TOKEN_KEY = 'trakt_token';
+    // v0.1.13: настройка кастомного листа Trakt для статуса Dropped.
+    // Храним числовой ids.trakt листа (slug ломается при rename).
+    var STORAGE_DROPPED_LIST_ID = 'trakt_v2_dropped_list_id';
+    // Кеш списка пользовательских листов: [{id:Number, name:String}, ...].
+    // Обновляется через fetchUserLists(); используется селектором настроек.
+    var STORAGE_DROPPED_LISTS_CACHE = 'trakt_v2_dropped_lists_cache';
 
     // TMDB. Ключ — встроенный в ядро Lampa. На Финальной независимости заменим на свой.
     var TMDB_URL = 'https://api.themoviedb.org/3';
@@ -173,6 +198,26 @@
     function getToken() {
         try { return String(Lampa.Storage.get(STORAGE_TOKEN_KEY) || ''); }
         catch (e) { return ''; }
+    }
+
+    // v0.1.13: helpers для настройки кастомного листа Dropped
+    function getDroppedListId() {
+        try {
+            var v = Lampa.Storage.get(STORAGE_DROPPED_LIST_ID, '0');
+            var n = Number(v);
+            return n > 0 ? n : 0;
+        } catch (_) { return 0; }
+    }
+    function getCachedLists() {
+        try {
+            var raw = Lampa.Storage.get(STORAGE_DROPPED_LISTS_CACHE, '[]');
+            // Lampa.Storage может вернуть уже распарсенный объект или строку — обрабатываем оба
+            var parsed = (typeof raw === 'string') ? JSON.parse(raw) : raw;
+            return Array.isArray(parsed) ? parsed : [];
+        } catch (_) { return []; }
+    }
+    function setCachedLists(lists) {
+        try { Lampa.Storage.set(STORAGE_DROPPED_LISTS_CACHE, JSON.stringify(lists || [])); } catch (_) {}
     }
 
     function apiGet(path) {
@@ -275,21 +320,67 @@
         if (!seasons || !seasons.length) return Promise.reject({ code: 'no_progress_seasons' });
         return apiPost('/sync/history', buildHistoryAddShowPayload(card, new Date().toISOString()));
     }
-    function postHiddenAddTriple(card) {
-        if (card.trakt_type !== 'show') return Promise.reject({ code: 'movies_drop_unsupported' });
-        var p = { shows: [{ ids: buildIdsObj(card) }] };
-        return Promise.all([
-            apiPost('/users/hidden/progress_watched', p).catch(function () { return null; }),
-            apiPost('/users/hidden/dropped',          p).catch(function () { return null; })
-        ]);
+    // v0.1.13: запись в кастомный пользовательский лист.
+    function postListAdd(listId, card) {
+        return apiPost('/users/me/lists/' + listId + '/items',        buildMediaPayload(card));
     }
-    function postHiddenRemoveTriple(card) {
-        if (card.trakt_type !== 'show') return Promise.reject({ code: 'movies_drop_unsupported' });
-        var p = { shows: [{ ids: buildIdsObj(card) }] };
-        return Promise.all([
-            apiPost('/users/hidden/progress_watched/remove', p).catch(function () { return null; }),
-            apiPost('/users/hidden/dropped/remove',          p).catch(function () { return null; })
-        ]);
+    function postListRemove(listId, card) {
+        return apiPost('/users/me/lists/' + listId + '/items/remove', buildMediaPayload(card));
+    }
+
+    // v0.1.13: Dropped write — hdr + list (НЕ пишем в hpw, см. docblock про
+    // Moviebase one-way trap). Movies требуют listId, иначе rejection с
+    // понятным кодом — handler покажет пользователю notify «настройте папку».
+    function postDroppedSet(card) {
+        var listId = getDroppedListId();
+        var ops = [];
+        if (card.trakt_type === 'show') {
+            var sp = { shows: [{ ids: buildIdsObj(card) }] };
+            ops.push(apiPost('/users/hidden/dropped', sp).catch(function () { return null; }));
+        }
+        if (listId) {
+            ops.push(postListAdd(listId, card).catch(function () { return null; }));
+        }
+        if (ops.length === 0) {
+            // movie + нет listId → нечего делать
+            return Promise.reject({ code: 'no_dropped_list_for_movie' });
+        }
+        return Promise.all(ops);
+    }
+    function postDroppedClear(card) {
+        var listId = getDroppedListId();
+        var ops = [];
+        if (card.trakt_type === 'show') {
+            var sp = { shows: [{ ids: buildIdsObj(card) }] };
+            ops.push(apiPost('/users/hidden/dropped/remove', sp).catch(function () { return null; }));
+        }
+        if (listId) {
+            ops.push(postListRemove(listId, card).catch(function () { return null; }));
+        }
+        if (ops.length === 0) {
+            return Promise.reject({ code: 'no_dropped_list_for_movie' });
+        }
+        return Promise.all(ops);
+    }
+
+    // v0.1.13: подгрузка пользовательских листов Trakt для селектора настроек.
+    // Упрощает до [{id:Number, name:String}], кеширует в Storage. На сетевой
+    // ошибке возвращает закешированную версию (settings selector всё равно
+    // показывает что-то осмысленное).
+    function fetchUserLists() {
+        if (!getToken()) return Promise.resolve(getCachedLists());
+        return apiGet('/users/me/lists').then(function (lists) {
+            if (!Array.isArray(lists)) return [];
+            var simplified = lists.map(function (l) {
+                return { id: l && l.ids && l.ids.trakt, name: l && l.name };
+            }).filter(function (x) { return x.id && x.name; });
+            setCachedLists(simplified);
+            try { console.log('[trakt_v2] fetchUserLists ok, count=' + simplified.length); } catch (_) {}
+            return simplified;
+        }).catch(function (err) {
+            try { console.warn('[trakt_v2] fetchUserLists failed', err); } catch (_) {}
+            return getCachedLists();
+        });
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -447,20 +538,25 @@
                 return [];
             });
         }
+        // v0.1.13: hpw НЕ читаем (см. docblock). list читаем если listId настроен.
+        var droppedListId = getDroppedListId();
+        var listFetch = droppedListId
+            ? fetchSafe('/users/me/lists/' + droppedListId + '/items?type=show,movie&limit=200')
+            : Promise.resolve([]);
         return Promise.all([
             fetchSafe('/sync/watchlist/movies?extended=full'),
             fetchSafe('/sync/watchlist/shows?extended=full'),
             fetchSafe('/sync/watched/movies?extended=full'),
             fetchSafe('/sync/watched/shows?extended=full'),
-            fetchSafe('/users/hidden/progress_watched?type=show&limit=1000'),
-            fetchSafe('/users/hidden/dropped?type=show&limit=1000')
+            fetchSafe('/users/hidden/dropped?type=show&limit=1000'),
+            listFetch
         ]).then(function (rows) {
             var wlMovies      = rows[0] || [];
             var wlShows       = rows[1] || [];
             var watchedMovies = rows[2] || [];
             var watchedShows  = rows[3] || [];
-            var hiddenPW      = rows[4] || [];
-            var hiddenDR      = rows[5] || [];
+            var hiddenDR      = rows[4] || [];
+            var listItems     = rows[5] || [];
 
             try {
                 console.log('[trakt_v2] raw fetch:',
@@ -468,20 +564,34 @@
                     'wlSh=' + wlShows.length,
                     'wMov=' + watchedMovies.length,
                     'wSh=' + watchedShows.length,
-                    'hPW=' + hiddenPW.length,
-                    'hDR=' + hiddenDR.length);
+                    'hDR=' + hiddenDR.length,
+                    'list=' + listItems.length + (droppedListId ? '' : ' (no listId)'));
             } catch (_) {}
 
-            // Множество скрытых tmdb-id (только сериалы — hidden API без type=movie)
-            var droppedTmdb = {};
-            function addDropped(arr) {
+            // Type-aware множество для Dropped: ключи 'show:<tmdb>' / 'movie:<tmdb>'
+            // потому что custom list возвращает И shows И movies.
+            var droppedTmdbByType = {};
+            function addDroppedHidden(arr) {
+                // hidden API возвращает только shows
                 for (var i = 0; i < arr.length; i++) {
                     var s = arr[i] && arr[i].show;
-                    if (s && s.ids && s.ids.tmdb) droppedTmdb[s.ids.tmdb] = true;
+                    if (s && s.ids && s.ids.tmdb) droppedTmdbByType['show:' + s.ids.tmdb] = true;
                 }
             }
-            addDropped(hiddenPW);
-            addDropped(hiddenDR);
+            function addDroppedList(arr) {
+                // list items: { type: 'movie'|'show', movie?: {...}, show?: {...} }
+                for (var i = 0; i < arr.length; i++) {
+                    var it = arr[i];
+                    if (!it) continue;
+                    if (it.type === 'show' && it.show && it.show.ids && it.show.ids.tmdb) {
+                        droppedTmdbByType['show:' + it.show.ids.tmdb] = true;
+                    } else if (it.type === 'movie' && it.movie && it.movie.ids && it.movie.ids.tmdb) {
+                        droppedTmdbByType['movie:' + it.movie.ids.tmdb] = true;
+                    }
+                }
+            }
+            addDroppedHidden(hiddenDR);
+            addDroppedList(listItems);
 
             // Дедуп по ключу type:tmdb. Узел копит флаги принадлежности к источникам.
             var byKey = {};
@@ -530,12 +640,11 @@
             processWatched(watchedMovies, 'movie');
             processWatched(watchedShows,  'show');
 
-            // Помечаем dropped (только shows — hidden API без type=movie)
+            // Помечаем dropped по type-aware ключу (shows из hdr; shows+movies из list)
             Object.keys(byKey).forEach(function (k) {
                 var n = byKey[k];
-                if (n.type === 'show' && n.media.ids.tmdb && droppedTmdb[n.media.ids.tmdb]) {
-                    n.dropped = true;
-                }
+                if (!n.media.ids.tmdb) return;
+                if (droppedTmdbByType[n.type + ':' + n.media.ids.tmdb]) n.dropped = true;
             });
 
             // Per-show progress fetch (только для shows в watched — иначе progress
@@ -1068,7 +1177,7 @@
                         .catch(function (err) { try { console.warn('[trakt_v2] finished remove failed', err); } catch (_) {} notify(Lampa.Lang.translate('trakt_v2_load_error')); });
                 }
                 var ops = [];
-                if (status === STATUS.DROPPED) ops.push(postHiddenRemoveTriple(card).catch(function () { return null; }));
+                if (status === STATUS.DROPPED) ops.push(postDroppedClear(card).catch(function () { return null; }));
                 ops.push(postHistoryAddMovie(card));
                 if (wl) ops.push(postWatchlistRemove(card).catch(function () { return null; }));
                 return Promise.all(ops)
@@ -1078,7 +1187,7 @@
             // show
             if (status === STATUS.UPCOMING || status === STATUS.FINISHED) return Promise.resolve();
             var sops = [];
-            if (status === STATUS.DROPPED) sops.push(postHiddenRemoveTriple(card).catch(function () { return null; }));
+            if (status === STATUS.DROPPED) sops.push(postDroppedClear(card).catch(function () { return null; }));
             sops.push(postHistoryAddShow(card));
             if (wl) sops.push(postWatchlistRemove(card).catch(function () { return null; }));
             return Promise.all(sops)
@@ -1089,22 +1198,32 @@
                     else notify(Lampa.Lang.translate('trakt_v2_load_error'));
                 });
         }
-        // Dropped
+        // Dropped (v0.1.13: hdr + custom list, без hpw; movies требуют listId)
         if (action === 'dropped') {
-            if (type === 'movie') {
-                notify('Dropped for movies: not yet supported');
-                return Promise.resolve();
-            }
             if (status === STATUS.DROPPED) {
-                return postHiddenRemoveTriple(card)
+                return postDroppedClear(card)
                     .then(function () { applyOptimisticUpdate(action, card); notify('Dropped: removed'); })
-                    .catch(function (err) { try { console.warn('[trakt_v2] dropped remove failed', err); } catch (_) {} notify(Lampa.Lang.translate('trakt_v2_load_error')); });
+                    .catch(function (err) {
+                        try { console.warn('[trakt_v2] dropped remove failed', err); } catch (_) {}
+                        if (err && err.code === 'no_dropped_list_for_movie') {
+                            notify('Dropped: настройте папку для фильмов в настройках Trakt');
+                        } else {
+                            notify(Lampa.Lang.translate('trakt_v2_load_error'));
+                        }
+                    });
             }
-            var dops = [postHiddenAddTriple(card)];
+            var dops = [postDroppedSet(card)];
             if (wl) dops.push(postWatchlistRemove(card).catch(function () { return null; }));
             return Promise.all(dops)
                 .then(function () { applyOptimisticUpdate(action, card); notify('Dropped: added'); })
-                .catch(function (err) { try { console.warn('[trakt_v2] dropped add failed', err); } catch (_) {} notify(Lampa.Lang.translate('trakt_v2_load_error')); });
+                .catch(function (err) {
+                    try { console.warn('[trakt_v2] dropped add failed', err); } catch (_) {}
+                    if (err && err.code === 'no_dropped_list_for_movie') {
+                        notify('Dropped: настройте папку для фильмов в настройках Trakt');
+                    } else {
+                        notify(Lampa.Lang.translate('trakt_v2_load_error'));
+                    }
+                });
         }
         return Promise.resolve();
     }
@@ -1304,6 +1423,41 @@
     }
 
     // ────────────────────────────────────────────────────────────────────
+    // Lampa SettingsApi: селектор кастомного листа Dropped
+    // ────────────────────────────────────────────────────────────────────
+    // Регистрируемся под component:'trakttv' (раздел от trakt_by_LME) — паттерн
+    // v1 (см. memory reference_v1_type_resolution.md / project_v2_native_folders_removal.md).
+    // Свой component через addComponent в v1 оказался нестабильным, не пытаемся.
+    function registerSettings() {
+        if (!window.Lampa || !Lampa.SettingsApi || typeof Lampa.SettingsApi.addParam !== 'function') return;
+        try {
+            var values = { '0': 'Не выбрано' };
+            getCachedLists().forEach(function (l) {
+                if (l && l.id) values[String(l.id)] = String(l.name || ('list ' + l.id));
+            });
+            Lampa.SettingsApi.addParam({
+                component: 'trakttv',
+                param: {
+                    name: STORAGE_DROPPED_LIST_ID,
+                    type: 'select',
+                    values: values,
+                    'default': '0'
+                },
+                field: {
+                    name: 'Trakt v2: папка для статуса Dropped',
+                    description: 'Кастомный список Trakt, в который плагин дублирует Dropped. ' +
+                                 'Без выбора Dropped для фильмов недоступен (Trakt hidden API не поддерживает movies). ' +
+                                 'Создайте список в Trakt-веб, затем выберите его здесь. ' +
+                                 'Список тянется при старте плагина — если только что создали, перезагрузите страницу.'
+                }
+            });
+            try { console.log('[trakt_v2] settings registered (trakttv component, param=' + STORAGE_DROPPED_LIST_ID + ', cached_lists=' + (Object.keys(values).length - 1) + ')'); } catch (_) {}
+        } catch (e) {
+            try { console.warn('[trakt_v2] registerSettings failed', e); } catch (_) {}
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
     // Bootstrap
     // ────────────────────────────────────────────────────────────────────
     function start() {
@@ -1313,6 +1467,15 @@
         registerLang();
         Lampa.Component.add(COMPONENT, MainComponent);
         registerCardSidebar();
+        registerSettings();
+
+        // Async: подтягиваем актуальный список Trakt-листов в кеш — селектор
+        // настроек на следующем открытии покажет свежие имена.
+        if (getToken()) {
+            fetchUserLists().then(function (lists) {
+                try { console.log('[trakt_v2] user lists refreshed, count=' + (lists ? lists.length : 0)); } catch (_) {}
+            });
+        }
 
         // Capture-phase hook на 'hover:long' — основной механизм state-aware
         // подписей. Срабатывает ПЕРЕД Lampa.Card.onMenu, читает card_data из
