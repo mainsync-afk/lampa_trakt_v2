@@ -46,23 +46,35 @@
  *    card-data в buildSections (Object.assign({}, c)). Без клонирования
  *    Lampa.Card мутировал общий объект и второй ряд молча терял карточку.
  *
- * v0.1.9: state-aware sidebar labels — рабочая реализация.
- *  - Заменили Listener.follow('full') на патч Lampa.Select.show. Когда меню
- *    открывается с нашими пунктами (детектим по String(item.onSelect) c
- *    подстрокой 'handleSidebarTap'), мутируем item.title для каждой нашей
- *    записи на лету, до передачи в orig.show.
- *  - Карточку, на которой стоит долгий тап, ловим через line.onFocus в нашей
- *    MainComponent — последняя сфокусированная карточка хранится в
- *    currentFocusedCard. На Path 2 (long-press в нашей папке) это работает,
- *    т.к. курсор обязательно сначала попадает в onFocus. Для Path 3 (long-
- *    press в нативной папке) currentFocusedCard будет stale/null — пункты
- *    покажут default. Path 3 fix — отдельная задача.
- *  - Удалены: updateSidebarLabels (больше не нужен), Listener.follow('full')
- *    инсталляция (мёртвый код).
+ * v0.1.9: state-aware sidebar labels — попытка через Select.show patch.
+ *  - Заменили Listener.follow('full') на патч Lampa.Select.show. Карточку
+ *    ловили через line.onFocus → currentFocusedCard. На реальных тестах
+ *    подписи всё равно не обновлялись: Lampa-исходник Card.onMenu читает
+ *    plugin.name синхронно ВНУТРИ forEach по Manifest.plugins, и наш patch
+ *    стрелял слишком поздно (или не на ту фазу — не выяснили).
+ *  - Удалены: updateSidebarLabels, Listener.follow('full') (мёртвый код).
+ *
+ * v0.1.10: state-aware sidebar labels — рабочая реализация через hover:long
+ * capture-phase hook (после изучения src/interaction/card.js в lampa-source).
+ *  - Card.onMenu в Lampa строит action-сайдбар на DOM event 'hover:long'
+ *    (long-press на карточке). Внутри он делает Manifest.plugins.forEach и
+ *    использует plugin.name КАК item.title. Если plugin.name свежий в
+ *    момент forEach — Lampa отрендерит его как есть.
+ *  - На карточке-DOM-элементе лежит el.card_data (JS-property, не data-*).
+ *  - Регистрируем capture-phase listener на document для 'hover:long' —
+ *    он гарантированно срабатывает ПЕРЕД bubble-listener-ом Lampa.
+ *    Из event.target.closest('.card') читаем card_data → мутируем
+ *    plugin.name на всех 5 наших entries через labelFor(action, card).
+ *  - Бонус: тот же hook чинит Path 3 (long-press в нативной папке) — там
+ *    тоже Lampa.Card, тоже hover:long, тоже card_data на DOM. Подписи
+ *    станут state-aware и в native рядах.
+ *  - Сохраняем v0.1.9 patchSelectShowForLabels как defensive layer на
+ *    случай если capture-hook на каких-то платформах не пробьётся.
  *  - Маркеры: ☐ Watchlist / ☑ Watchlist (toggle, всегда виден чекбокс),
  *    Progress / ✓ Progress (single-select, ✓ только у активного).
  *
- * Архитектура: см. SPEC_v2.md §«Раскладка экрана»
+ * Архитектура: см. SPEC_v2.md §«Раскладка экрана»; механика sidebar:
+ * см. memory reference_lampa_card_onmenu.md
  * Зависимости: Lampa runtime; токен Trakt берётся из Lampa.Storage (выпускается плагином trakt_by_LME)
  * Прокси Trakt API: https://apx.lme.isroot.in/trakt
  * TMDB API: https://api.themoviedb.org/3 (прямой, тот же ключ что у ядра Lampa)
@@ -70,7 +82,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '0.1.9';
+    var VERSION = '0.1.10';
     try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
@@ -1005,9 +1017,68 @@
         } catch (_) {}
     }
 
+    // Мутирует outer plugin.name на каждой нашей записи в Lampa.Manifest.plugins
+    // на основе состояния карточки. Источник истины для отображения подписей в
+    // action-сайдбаре — Lampa-исходник Card.onMenu (см. memory
+    // reference_lampa_card_onmenu.md): он читает plugin.name синхронно при
+    // построении меню, поэтому если name свежий ДО события 'hover:long' (через
+    // capture-phase hook), Lampa сразу отрендерит правильно.
+    function updateAllOurPluginNames(card) {
+        if (!window.Lampa || !Lampa.Manifest || !Array.isArray(Lampa.Manifest.plugins)) return;
+        try {
+            var labels = {};
+            SIDEBAR_ORDER.forEach(function (a) { labels[a] = labelFor(a, card); });
+            for (var i = 0; i < Lampa.Manifest.plugins.length; i++) {
+                var entry = Lampa.Manifest.plugins[i];
+                if (!entry || typeof entry.__trakt_v2 !== 'string') continue;
+                var action = entry.__trakt_v2.replace(/^trakt_v2:/, '');
+                if (labels.hasOwnProperty(action)) entry.name = labels[action];
+            }
+            try {
+                console.log('[trakt_v2] plugin.name updated:', JSON.stringify(labels),
+                            'card.id=', card && (card.id || (card.ids && card.ids.tmdb)));
+            } catch (_) {}
+        } catch (e) {
+            try { console.warn('[trakt_v2] updateAllOurPluginNames failed', e); } catch (_) {}
+        }
+    }
+
+    // Capture-phase hook на 'hover:long' DOM event — стреляет ПЕРЕД bubble-
+    // listener-ом Lampa в src/interaction/card.js. Получает event.target →
+    // ищет ближайший .card родитель с card_data → мутирует plugin.name по
+    // состоянию найденной карточки → Lampa.Card.onMenu в bubble фазе читает
+    // обновлённый plugin.name и строит item.title правильно.
+    // Также обновляет currentFocusedCard для совместимости с
+    // patchSelectShowForLabels (defensive layer).
+    function installHoverLongHook() {
+        if (typeof document === 'undefined' || !document.addEventListener) return;
+        if (window.__trakt_v2_hoverlong_installed) return;
+        window.__trakt_v2_hoverlong_installed = true;
+        document.addEventListener('hover:long', function (e) {
+            try {
+                var el = e && e.target;
+                while (el && el.nodeType === 1 && el !== document.body) {
+                    if (el.card_data) {
+                        var card = el.card_data;
+                        currentFocusedCard = card;
+                        updateAllOurPluginNames(card);
+                        return;
+                    }
+                    el = el.parentElement;
+                }
+                try { console.log('[trakt_v2] hover:long fired but no .card_data ancestor found'); } catch (_) {}
+            } catch (err) {
+                try { console.warn('[trakt_v2] hover:long handler err', err); } catch (_) {}
+            }
+        }, true /* capture phase — до Lampa-листенера */);
+        try { console.log('[trakt_v2] hover:long capture hook installed on document'); } catch (_) {}
+    }
+
     // Патчит Lampa.Select.show один раз. Когда меню содержит наши пункты —
     // мутируем их item.title по currentFocusedCard. Идемпотентно (проверяем
-    // флаг __trakt_v2_patched на новой функции).
+    // флаг __trakt_v2_patched на новой функции). Defensive layer на случай
+    // если capture-hook на hover:long не пробьётся (например, Tizen DOM
+    // events).
     function patchSelectShowForLabels() {
         if (!Lampa.Select || typeof Lampa.Select.show !== 'function') return;
         if (Lampa.Select.show.__trakt_v2_patched) return;
@@ -1098,11 +1169,16 @@
         Lampa.Component.add(COMPONENT, MainComponent);
         registerCardSidebar();
 
-        // Патч Lampa.Select.show: при открытии любого меню с нашими пунктами
-        // (детект — substring 'handleSidebarTap' в item.onSelect.toString())
-        // мутируем item.title под состояние currentFocusedCard. Это и есть
-        // механизм state-aware подписей для Path 2 (long-press в нашей папке).
-        // См. docblock v0.1.9 о причинах отказа от Listener.follow('full').
+        // Capture-phase hook на 'hover:long' — основной механизм state-aware
+        // подписей. Срабатывает ПЕРЕД Lampa.Card.onMenu, читает card_data из
+        // event.target.closest('.card'), мутирует plugin.name. Чинит Path 2
+        // и Path 3 одним выстрелом. См. docblock v0.1.10.
+        installHoverLongHook();
+
+        // Defensive layer: патч Lampa.Select.show — мутирует item.title прямо
+        // в момент открытия меню по currentFocusedCard. Включается, если
+        // capture-hook не пробился. Идемпотентен с hook (если оба сработали
+        // — title уже правильный, патч не меняет).
         patchSelectShowForLabels();
 
         if (window.appready) {
