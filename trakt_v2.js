@@ -1,8 +1,8 @@
 /*!
  * trakt_v2.js — Lampa-Trakt Plugin v2
- * Phase 1 + classifier + multi-section layout:
- * пункт меню + Activity component + 5 секций (Watchlist/Progress/Finished/
- * Upcoming/Dropped) через нативный Lampa.InteractionLine.
+ * Phase 1 + classifier + multi-section layout + write-actions:
+ * пункт меню + Activity component + 5 секций + 5 пунктов в нативном
+ * сайдбаре карточки.
  *
  * v0.1.4: переписана раскладка на нативные примитивы Lampa после ресёрча
  * нативного экрана «Избранное» (компонент `bookmarks`). Outer Lampa.Scroll
@@ -27,6 +27,13 @@
  * InteractionLine.visible() → Layer.visible(scroll.render) → lazy-load
  * картинок без необходимости прокрутки.
  *
+ * v0.1.7: Phase 2 — write-actions через нативное контекстное меню карточки.
+ * Концептуально: статус (один из 4: Progress/Upcoming/Finished/Dropped) стал
+ * отделён от Watchlist-флажка (ортогональный boolean). Карточка может иметь
+ * статус И WL одновременно. На главном экране ряд Watchlist показывает все
+ * WL=true карточки независимо от статуса. Регистрация 5 пунктов в
+ * Lampa.Manifest.plugins; tap-обработчики по матрице из reference_v2_data_model.md.
+ *
  * Архитектура: см. SPEC_v2.md §«Раскладка экрана»
  * Зависимости: Lampa runtime; токен Trakt берётся из Lampa.Storage (выпускается плагином trakt_by_lampame)
  * Прокси Trakt API: https://apx.lme.isroot.in/trakt
@@ -35,7 +42,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '0.1.6';
+    var VERSION = '0.1.7';
     try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
@@ -48,15 +55,14 @@
     var TMDB_IMG = 'https://image.tmdb.org/t/p';
 
     // ────────────────────────────────────────────────────────────────────
-    // Status codes (внутренние, как в v1; UI отображает русские имена)
+    // Модель: 4 взаимоисключающих статуса + ортогональный Watchlist флажок.
+    // Watchlist НЕ статус (см. reference_v2_data_model.md).
     // ────────────────────────────────────────────────────────────────────
-    var STATUS = { WATCHLIST: 'watchlist', PROGRESS: 'progress', FINISHED: 'finished', UPCOMING: 'upcoming', DROPPED: 'dropped' };
-    var STATUS_ORDER = ['watchlist', 'progress', 'finished', 'upcoming', 'dropped'];
-    // Лейблы в UI. Английские — рабочие на этапе разработки и тестов;
-    // в финале можно перевести на русский / другой язык (см. SPEC §«Модель папок»).
-    // Английские слова намеренно отличаются от нативных Lampa-папок («Просмотрено»,
-    // «Брошено») — чтобы при появлении нашего сайдбара на детальной карточке (Phase 2)
-    // не было визуальной коллизии с нативным Lampa.Favorite.
+    var STATUS = { PROGRESS: 'progress', FINISHED: 'finished', UPCOMING: 'upcoming', DROPPED: 'dropped' };
+    // Порядок рядов на главном экране. Watchlist первый и собирается отдельно.
+    var ROW_ORDER = ['watchlist', 'progress', 'finished', 'upcoming', 'dropped'];
+    // Порядок пунктов в нативном сайдбаре карточки.
+    var SIDEBAR_ORDER = ['progress', 'watchlist', 'upcoming', 'finished', 'dropped'];
     var STATUS_LABEL = {
         watchlist: { ru: 'Watchlist', en: 'Watchlist', uk: 'Watchlist' },
         progress:  { ru: 'Progress',  en: 'Progress',  uk: 'Progress'  },
@@ -118,6 +124,98 @@
             xhr.ontimeout = function () { reject({ status: 0, code: 'timeout' }); };
             xhr.send();
         });
+    }
+
+    function apiPost(path, payload) {
+        return new Promise(function (resolve, reject) {
+            var token = getToken();
+            if (!token) { reject({ status: 401, code: 'no_token' }); return; }
+            var xhr = new XMLHttpRequest();
+            try { xhr.open('POST', API_URL + path, true); }
+            catch (e) { reject({ status: 0, code: 'open_failed', error: e }); return; }
+            xhr.setRequestHeader('Content-Type', 'application/json');
+            xhr.setRequestHeader('trakt-api-version', '2');
+            xhr.setRequestHeader('Authorization', 'Bearer ' + token);
+            xhr.timeout = 20000;
+            xhr.onload = function () {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    try { resolve(xhr.responseText ? JSON.parse(xhr.responseText) : null); }
+                    catch (e) { resolve(null); }
+                } else {
+                    reject({ status: xhr.status, code: 'http_error', body: xhr.responseText });
+                }
+            };
+            xhr.onerror = function () { reject({ status: 0, code: 'network' }); };
+            xhr.ontimeout = function () { reject({ status: 0, code: 'timeout' }); };
+            try { xhr.send(JSON.stringify(payload || {})); }
+            catch (e) { reject({ status: 0, code: 'send_failed', error: e }); }
+        });
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Trakt write helpers — принимают карточку из кеша (с trakt_type/trakt_ids
+    // и опц. _trakt_progress_seasons).
+    // ────────────────────────────────────────────────────────────────────
+    function buildIdsObj(card) {
+        var ids = card.trakt_ids || {};
+        var out = {};
+        if (ids.tmdb)  out.tmdb  = ids.tmdb;
+        if (ids.trakt) out.trakt = ids.trakt;
+        if (ids.imdb)  out.imdb  = ids.imdb;
+        if (ids.slug)  out.slug  = ids.slug;
+        return out;
+    }
+    function buildMediaPayload(card) {
+        var entry = { ids: buildIdsObj(card) };
+        return card.trakt_type === 'movie' ? { movies: [entry] } : { shows: [entry] };
+    }
+    function buildHistoryAddShowPayload(card, watchedAt) {
+        var ids = buildIdsObj(card);
+        var src = card._trakt_progress_seasons || [];
+        var seasons = [];
+        for (var i = 0; i < src.length; i++) {
+            var s = src[i];
+            if (!s || !s.episodes) continue;
+            var sn = Number(s.number);
+            if (sn === 0) continue;
+            var eps = [];
+            for (var j = 0; j < s.episodes.length; j++) {
+                var e = s.episodes[j];
+                if (!e || typeof e.number !== 'number') continue;
+                eps.push({ number: e.number, watched_at: watchedAt });
+            }
+            if (eps.length) seasons.push({ number: sn, episodes: eps });
+        }
+        return { shows: [{ ids: ids, seasons: seasons }] };
+    }
+    function postWatchlistAdd(card)    { return apiPost('/sync/watchlist',        buildMediaPayload(card)); }
+    function postWatchlistRemove(card) { return apiPost('/sync/watchlist/remove', buildMediaPayload(card)); }
+    function postHistoryAddMovie(card) {
+        return apiPost('/sync/history', { movies: [{ ids: buildIdsObj(card), watched_at: new Date().toISOString() }] });
+    }
+    function postHistoryRemoveMovie(card) {
+        return apiPost('/sync/history/remove', { movies: [{ ids: buildIdsObj(card) }] });
+    }
+    function postHistoryAddShow(card) {
+        var seasons = card._trakt_progress_seasons;
+        if (!seasons || !seasons.length) return Promise.reject({ code: 'no_progress_seasons' });
+        return apiPost('/sync/history', buildHistoryAddShowPayload(card, new Date().toISOString()));
+    }
+    function postHiddenAddTriple(card) {
+        if (card.trakt_type !== 'show') return Promise.reject({ code: 'movies_drop_unsupported' });
+        var p = { shows: [{ ids: buildIdsObj(card) }] };
+        return Promise.all([
+            apiPost('/users/hidden/progress_watched', p).catch(function () { return null; }),
+            apiPost('/users/hidden/dropped',          p).catch(function () { return null; })
+        ]);
+    }
+    function postHiddenRemoveTriple(card) {
+        if (card.trakt_type !== 'show') return Promise.reject({ code: 'movies_drop_unsupported' });
+        var p = { shows: [{ ids: buildIdsObj(card) }] };
+        return Promise.all([
+            apiPost('/users/hidden/progress_watched/remove', p).catch(function () { return null; }),
+            apiPost('/users/hidden/dropped/remove',          p).catch(function () { return null; })
+        ]);
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -227,27 +325,35 @@
     // Classifier (SPEC §«Классификатор статуса»)
     // ────────────────────────────────────────────────────────────────────
     function classifyMovie(node) {
-        // hidden API не поддерживает type=movie, но если custom-list "Брошено"
-        // в будущем подключим — сюда зайдёт node.dropped через него.
         if (node.dropped) return STATUS.DROPPED;
         if (node.in_watched) return STATUS.FINISHED;
-        if (node.in_watchlist) return STATUS.WATCHLIST;
-        return null;
+        return null; // None — карточка может иметь только trakt_watchlist=true
     }
 
     function classifyShow(node) {
         if (node.dropped) return STATUS.DROPPED;
         var p = node.progress;
         var completed = p ? Number(p.completed || 0) : 0;
-        if (completed === 0) {
-            return node.in_watchlist ? STATUS.WATCHLIST : null;
-        }
+        if (completed === 0) return null; // None — может быть в watchlist флажком
         var hasNext = p && p.next_episode;
         if (hasNext) return STATUS.PROGRESS;
         var s = String(node.media.status || '').toLowerCase();
         if (s === 'ended' || s === 'canceled') return STATUS.FINISHED;
-        // returning series / in production / planned / pilot — всё это «ждём новых серий»
         return STATUS.UPCOMING;
+    }
+
+    // Кеш результатов последнего fetchAll (для read-state в sidebar handler).
+    var LAST_RESULTS = [];
+    function findInCache(tmdbId, type) {
+        if (!tmdbId) return null;
+        var key = String(tmdbId);
+        for (var i = 0; i < LAST_RESULTS.length; i++) {
+            var c = LAST_RESULTS[i];
+            if (c && c.trakt_ids && String(c.trakt_ids.tmdb) === key && (!type || c.trakt_type === type)) {
+                return c;
+            }
+        }
+        return null;
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -373,17 +479,26 @@
             })).then(function () {
                 // Классификация + сборка card-data
                 var classified = [];
-                var counts = { watchlist: 0, progress: 0, finished: 0, upcoming: 0, dropped: 0 };
+                var counts = { watchlist: 0, progress: 0, finished: 0, upcoming: 0, dropped: 0, none_with_wl: 0 };
                 Object.keys(byKey).forEach(function (k) {
                     var n = byKey[k];
                     var status = n.type === 'movie' ? classifyMovie(n) : classifyShow(n);
-                    if (!status) return;
+                    var watchlist = !!n.in_watchlist;
+                    if (!status && !watchlist) return; // None+WL=false — пропускаем
                     var card = formatMedia(n.media, n.type);
                     if (!card) return;
-                    card.trakt_status = status;
+                    card.trakt_status = status;            // null | 'progress' | 'finished' | 'upcoming' | 'dropped'
+                    card.trakt_watchlist = watchlist;      // boolean (ортогональный)
                     card.trakt_listed_at = n.listed_at;
+                    card.trakt_type = n.type;              // 'movie' | 'show'
+                    card.trakt_ids = n.media.ids || {};
+                    if (n.type === 'show' && n.progress) {
+                        card._trakt_progress_seasons = n.progress.seasons || null;
+                    }
                     classified.push(card);
-                    counts[status]++;
+                    if (status) counts[status]++;
+                    if (watchlist) counts.watchlist++;
+                    if (!status && watchlist) counts.none_with_wl++;
                 });
 
                 try {
@@ -393,13 +508,14 @@
                         'progress=' + counts.progress,
                         'finished=' + counts.finished,
                         'upcoming=' + counts.upcoming,
-                        'dropped=' + counts.dropped);
+                        'dropped=' + counts.dropped,
+                        '(none+wl=' + counts.none_with_wl + ')');
                 } catch (_) {}
 
-                // Сортировка: сначала по приоритету статуса, внутри — по listed_at desc
+                // Сортировка: по приоритету статуса (null последним), внутри — по listed_at desc
                 classified.sort(function (a, b) {
-                    var sa = STATUS_ORDER.indexOf(a.trakt_status);
-                    var sb = STATUS_ORDER.indexOf(b.trakt_status);
+                    var sa = a.trakt_status ? ROW_ORDER.indexOf(a.trakt_status) : 99;
+                    var sb = b.trakt_status ? ROW_ORDER.indexOf(b.trakt_status) : 99;
                     if (sa !== sb) return sa - sb;
                     var ta = Date.parse(a.trakt_listed_at || '') || 0;
                     var tb = Date.parse(b.trakt_listed_at || '') || 0;
@@ -412,6 +528,7 @@
                         for (var i = 0; i < enriched.length; i++) if (enriched[i].poster) withPoster++;
                         console.log('[trakt_v2] tmdb enriched: with_poster=' + withPoster + '/' + enriched.length);
                     } catch (_) {}
+                    LAST_RESULTS = enriched;
                     return enriched;
                 });
             });
@@ -531,16 +648,20 @@
         }
 
         function buildSections(results) {
-            // Группируем по статусу
+            // Группируем:
+            //  - watchlist — все карточки с trakt_watchlist=true (независимо от статуса);
+            //    дубли с рядом статуса допустимы и осмысленны.
+            //  - остальные ряды — по trakt_status.
             var bystatus = { watchlist: [], progress: [], finished: [], upcoming: [], dropped: [] };
             for (var i = 0; i < results.length; i++) {
-                var s = results[i].trakt_status;
-                if (bystatus[s]) bystatus[s].push(results[i]);
+                var c = results[i];
+                if (c.trakt_watchlist) bystatus.watchlist.push(c);
+                if (c.trakt_status && bystatus[c.trakt_status]) bystatus[c.trakt_status].push(c);
             }
 
-            // Создаём по InteractionLine на каждый статус (даже если пусто — рисуем заголовок-плейсхолдер)
-            for (var k = 0; k < STATUS_ORDER.length; k++) {
-                var status = STATUS_ORDER[k];
+            // Создаём по InteractionLine на каждый ряд (пусто — заглушка с заголовком)
+            for (var k = 0; k < ROW_ORDER.length; k++) {
+                var status = ROW_ORDER[k];
                 var items = bystatus[status];
                 if (items.length === 0) {
                     // Пустая секция — рисуем простой DOM-заглушку с заголовком и текстом «пусто»
@@ -690,6 +811,125 @@
 
 
     // ────────────────────────────────────────────────────────────────────
+    // Sidebar tap handler — матрица из reference_v2_data_model.md.
+    // ────────────────────────────────────────────────────────────────────
+    function notify(text) {
+        try { Lampa.Noty.show(String(text || '')); } catch (_) {}
+    }
+    function refreshScreenIfActive() {
+        try {
+            var act = Lampa.Activity.active();
+            if (act && act.component === COMPONENT) {
+                Lampa.Activity.replace({
+                    url: '', title: Lampa.Lang.translate('trakt_v2_screen_title'),
+                    component: COMPONENT, page: 1
+                });
+            }
+        } catch (_) {}
+    }
+    function resolveCard(object) {
+        var tmdbId = object && (object.id || (object.ids && object.ids.tmdb));
+        var type = (object && (object.method === 'tv' || object.card_type === 'tv')) ? 'show' : 'movie';
+        var cached = findInCache(tmdbId, type);
+        if (cached) return cached;
+        return {
+            trakt_type: type, trakt_ids: { tmdb: tmdbId },
+            trakt_status: null, trakt_watchlist: false, _trakt_progress_seasons: null
+        };
+    }
+    function handleSidebarTap(action, object) {
+        var card = resolveCard(object);
+        var status = card.trakt_status;
+        var wl = !!card.trakt_watchlist;
+        var type = card.trakt_type;
+        try { console.log('[trakt_v2] sidebar tap:', action, 'on', type, card.trakt_ids && card.trakt_ids.tmdb, 'status=', status, 'wl=', wl); } catch (_) {}
+
+        // Watchlist toggle
+        if (action === 'watchlist') {
+            var p = wl ? postWatchlistRemove(card) : postWatchlistAdd(card);
+            return p.then(function () {
+                notify(wl ? 'Watchlist: removed' : 'Watchlist: added');
+                refreshScreenIfActive();
+            }).catch(function (err) {
+                try { console.warn('[trakt_v2] watchlist tap failed', err); } catch (_) {}
+                notify(Lampa.Lang.translate('trakt_v2_load_error'));
+            });
+        }
+        // Progress / Upcoming — индикаторы. Тап = noop без уведомлений.
+        if (action === 'progress' || action === 'upcoming') return Promise.resolve();
+
+        // Finished
+        if (action === 'finished') {
+            if (type === 'movie') {
+                if (status === STATUS.FINISHED) {
+                    return postHistoryRemoveMovie(card)
+                        .then(function () { notify('Finished: removed'); refreshScreenIfActive(); })
+                        .catch(function (err) { try { console.warn('[trakt_v2] finished remove failed', err); } catch (_) {} notify(Lampa.Lang.translate('trakt_v2_load_error')); });
+                }
+                var ops = [];
+                if (status === STATUS.DROPPED) ops.push(postHiddenRemoveTriple(card).catch(function () { return null; }));
+                ops.push(postHistoryAddMovie(card));
+                if (wl) ops.push(postWatchlistRemove(card).catch(function () { return null; }));
+                return Promise.all(ops)
+                    .then(function () { notify('Finished: added'); refreshScreenIfActive(); })
+                    .catch(function (err) { try { console.warn('[trakt_v2] finished add failed', err); } catch (_) {} notify(Lampa.Lang.translate('trakt_v2_load_error')); });
+            }
+            // show
+            if (status === STATUS.UPCOMING || status === STATUS.FINISHED) return Promise.resolve();
+            var sops = [];
+            if (status === STATUS.DROPPED) sops.push(postHiddenRemoveTriple(card).catch(function () { return null; }));
+            sops.push(postHistoryAddShow(card));
+            if (wl) sops.push(postWatchlistRemove(card).catch(function () { return null; }));
+            return Promise.all(sops)
+                .then(function () { notify('Finished: added'); refreshScreenIfActive(); })
+                .catch(function (err) {
+                    try { console.warn('[trakt_v2] finished show add failed', err); } catch (_) {}
+                    if (err && err.code === 'no_progress_seasons') notify('Finished: open card first to load episodes');
+                    else notify(Lampa.Lang.translate('trakt_v2_load_error'));
+                });
+        }
+        // Dropped
+        if (action === 'dropped') {
+            if (type === 'movie') {
+                notify('Dropped for movies: not yet supported');
+                return Promise.resolve();
+            }
+            if (status === STATUS.DROPPED) {
+                return postHiddenRemoveTriple(card)
+                    .then(function () { notify('Dropped: removed'); refreshScreenIfActive(); })
+                    .catch(function (err) { try { console.warn('[trakt_v2] dropped remove failed', err); } catch (_) {} notify(Lampa.Lang.translate('trakt_v2_load_error')); });
+            }
+            var dops = [postHiddenAddTriple(card)];
+            if (wl) dops.push(postWatchlistRemove(card).catch(function () { return null; }));
+            return Promise.all(dops)
+                .then(function () { notify('Dropped: added'); refreshScreenIfActive(); })
+                .catch(function (err) { try { console.warn('[trakt_v2] dropped add failed', err); } catch (_) {} notify(Lampa.Lang.translate('trakt_v2_load_error')); });
+        }
+        return Promise.resolve();
+    }
+
+    // Регистрация 5 пунктов в нативном сайдбаре карточки. Защитный extend массива
+    // — не перетираем существующие entries (например trakt_by_lampame).
+    function registerCardSidebar() {
+        if (!window.Lampa || !Lampa.Manifest) return;
+        if (!Array.isArray(Lampa.Manifest.plugins)) Lampa.Manifest.plugins = [];
+        SIDEBAR_ORDER.forEach(function (action) {
+            var marker = 'trakt_v2:' + action;
+            for (var i = 0; i < Lampa.Manifest.plugins.length; i++) {
+                if (Lampa.Manifest.plugins[i] && Lampa.Manifest.plugins[i].__trakt_v2 === marker) return;
+            }
+            Lampa.Manifest.plugins.push({
+                __trakt_v2: marker,
+                type: 'video',
+                name: 'Trakt v2: ' + statusLabel(action),
+                onContextMenu: function () { return { name: statusLabel(action) }; },
+                onContextLauch: function (object) { handleSidebarTap(action, object); }
+            });
+        });
+        try { console.log('[trakt_v2] sidebar plugins registered:', SIDEBAR_ORDER.join(',')); } catch (_) {}
+    }
+
+    // ────────────────────────────────────────────────────────────────────
     // DOM-инъекция пункта в левое меню
     // ────────────────────────────────────────────────────────────────────
     function ICON() {
@@ -731,6 +971,7 @@
 
         registerLang();
         Lampa.Component.add(COMPONENT, MainComponent);
+        registerCardSidebar();
 
         if (window.appready) {
             injectMenuItem();
