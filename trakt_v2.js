@@ -54,6 +54,22 @@
  *    стрелял слишком поздно (или не на ту фазу — не выяснили).
  *  - Удалены: updateSidebarLabels, Listener.follow('full') (мёртвый код).
  *
+ * v0.1.12: detectCardType — фикс мис-определения типа карточки в нативных папках.
+ *  - Был баг: long-press на сериале в нативной папке (trending/movies/shows)
+ *    → resolveCard возвращал 'movie' (потому что Lampa-нативные карточки не
+ *    имеют method/card_type — наши единственный сигнал) → postWatchlistAdd
+ *    слал { movies: [...] } с tmdb сериала → Trakt находил ДРУГОЙ фильм с
+ *    тем же tmdb-id и добавлял его в WL. Юзер видел чужой фильм в WL row,
+ *    сериал не попадал в Trakt.
+ *  - resolveCard теперь использует detectCardType с приоритетами:
+ *    (1) explicit method/card_type для наших карточек,
+ *    (2) Lampa-эвристика: name/original_name/first_air_date/number_of_seasons
+ *        => show (как сама Lampa определяет TV в card.js: type: data.name?'tv':'movie'),
+ *    (3) default movie.
+ *  - Сложные edge cases (карточка без TV-specific полей и без method) могут
+ *    остаться мис-классифицированными — fallback на Trakt /search/tmdb/:id
+ *    будет нужен в отдельной версии (см. SPEC_v2.md §«Резолв типа карточки»).
+ *
  * v0.1.11: оптимистичное обновление кеша вместо Activity.replace.
  *  - Раньше после каждого write-action делали refreshScreenIfActive() →
  *    Lampa.Activity.replace() → весь экран пересобирался: новый fetchAll,
@@ -100,7 +116,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '0.1.11';
+    var VERSION = '0.1.12';
     try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
@@ -980,9 +996,29 @@
                         'wl=', c.trakt_watchlist);
         } catch (_) {}
     }
+    // Определение типа карточки по её полям. Приоритеты:
+    //  1) explicit method/card_type (наши карточки из formatMedia)
+    //  2) Lampa-эвристика: data.name присутствует → TV (та же логика, что
+    //     использует сам Lampa в src/interaction/card.js: data.name ? 'tv' : 'movie').
+    //     Также проверяем original_name / first_air_date / number_of_seasons —
+    //     любой из них = show.
+    //  3) default → movie (наименее плохой fallback).
+    // На edge cases (карточка без TV-specific полей и без method) остаётся
+    // вероятность ошибки → SPEC рекомендует Trakt /search/tmdb/:id, отложено.
+    function detectCardType(object) {
+        if (!object) return 'movie';
+        if (object.method === 'tv' || object.card_type === 'tv') return 'show';
+        if (object.method === 'movie' || object.card_type === 'movie') return 'movie';
+        // Lampa-нативные карточки (trending/movies/shows и т.п.) часто не имеют
+        // method, но сохраняют TV-specific поля от TMDB-ответа.
+        if (object.name || object.original_name || object.first_air_date ||
+            object.number_of_seasons || object.episode_run_time) return 'show';
+        return 'movie';
+    }
+
     function resolveCard(object) {
         var tmdbId = object && (object.id || (object.ids && object.ids.tmdb));
-        var type = (object && (object.method === 'tv' || object.card_type === 'tv')) ? 'show' : 'movie';
+        var type = detectCardType(object);
         var cached = findInCache(tmdbId, type);
         if (cached) return cached;
         return {
@@ -995,7 +1031,19 @@
         var status = card.trakt_status;
         var wl = !!card.trakt_watchlist;
         var type = card.trakt_type;
-        try { console.log('[trakt_v2] sidebar tap:', action, 'on', type, card.trakt_ids && card.trakt_ids.tmdb, 'status=', status, 'wl=', wl); } catch (_) {}
+        try {
+            // Расширенная диагностика: какие поля у object были (для отладки detectCardType).
+            var sig = '';
+            if (object) {
+                if (object.method) sig += ' method=' + object.method;
+                if (object.card_type) sig += ' card_type=' + object.card_type;
+                if (object.name) sig += ' name=' + JSON.stringify(String(object.name).substr(0, 30));
+                if (object.first_air_date) sig += ' first_air_date=' + object.first_air_date;
+                if (object.title && !object.name) sig += ' title=' + JSON.stringify(String(object.title).substr(0, 30));
+            }
+            console.log('[trakt_v2] sidebar tap:', action, 'on', type, card.trakt_ids && card.trakt_ids.tmdb,
+                        'status=', status, 'wl=', wl, '| obj' + sig);
+        } catch (_) {}
 
         // Watchlist toggle
         if (action === 'watchlist') {
