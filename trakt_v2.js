@@ -1,16 +1,19 @@
 /*!
  * trakt_v2.js — Lampa-Trakt Plugin v2
- * Phase 1 + classifier: пункт меню + Activity component + единый список
- * по 5 статусам Trakt с TMDB-обогащением (постеры/локализация).
+ * Phase 1 + classifier + multi-section layout:
+ * пункт меню + Activity component + 5 секций (Watchlist/Progress/Finished/
+ * Upcoming/Dropped) через нативный Lampa.InteractionLine.
  *
- * v0.1.3: откат раскладки v0.1.2 (5 секций + якоря + raw DOM cards) —
- * на Tizen анкоры не реагировали, скролл не работал, карточки потеряли
- * нативный вид. Возврат к стабильному `Lampa.InteractionCategory` —
- * единый грид по 5 статусам, отсортированный по приоритету. Раскладку
- * из SPEC §«Раскладка экрана» переносим на отдельную итерацию (v0.1.4+),
- * после изучения нативного UI «Избранное» Lampa.
+ * v0.1.4: переписана раскладка на нативные примитивы Lampa после ресёрча
+ * нативного экрана «Избранное» (компонент `bookmarks`). Outer Lampa.Scroll
+ * (vertical, mask:true, over:true) + 5 × Lampa.InteractionLine. Карточки
+ * стандартные (через встроенный path InteractionLine → new Lampa.Card).
+ * Каждый InteractionLine сам управляет horizontal scroll и регистрирует
+ * controller `items_line`; outer controller `content` переключает между
+ * рядами через Navigator. Якорная панель (bookmarks-folder со счётчиками)
+ * — отдельная итерация v0.1.5.
  *
- * Архитектура: см. SPEC_v2.md
+ * Архитектура: см. SPEC_v2.md §«Раскладка экрана»
  * Зависимости: Lampa runtime; токен Trakt берётся из Lampa.Storage (выпускается плагином trakt_by_lampame)
  * Прокси Trakt API: https://apx.lme.isroot.in/trakt
  * TMDB API: https://api.themoviedb.org/3 (прямой, тот же ключ что у ядра Lampa)
@@ -18,7 +21,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '0.1.3';
+    var VERSION = '0.1.4';
     try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
@@ -65,7 +68,8 @@
                 ru: 'Не удалось загрузить данные из Trakt',
                 en: 'Failed to load Trakt data',
                 uk: 'Не вдалося завантажити дані з Trakt'
-            }
+            },
+            trakt_v2_section_empty:     { ru: 'пусто', en: 'empty', uk: 'порожньо' }
         });
     }
 
@@ -401,51 +405,222 @@
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // Activity component
+    // Activity component — v0.1.4: 5 секций через Lampa.InteractionLine
     // ────────────────────────────────────────────────────────────────────
+    //
+    // Архитектура:
+    //   outer  → Lampa.Scroll({mask:true, over:true})
+    //   inside →  5 × Lampa.InteractionLine — по одной на статус
+    //              (Watchlist/Progress/Finished/Upcoming/Dropped).
+    //   каждый  InteractionLine сам управляет horizontal scroll и
+    //   регистрирует controller 'items_line' (см. ресёрч лога 1777353372098).
+    //   outer controller 'content' переключает между рядами через Navigator.
+    //
+    // Якорная строка (bookmarks-folder со счётчиками) — следующая итерация.
+
+    function uiLang() {
+        try { return String(Lampa.Storage.get('language') || 'ru') || 'ru'; }
+        catch (_) { return 'ru'; }
+    }
+
+    function statusLabel(status) {
+        var l = uiLang();
+        var pack = STATUS_LABEL[status] || {};
+        return pack[l] || pack.en || status;
+    }
+
     function MainComponent(object) {
-        var comp = new Lampa.InteractionCategory(object);
+        var self = this;
+        var scroll = new Lampa.Scroll({ mask: true, over: true, step: 250 });
+        var html = $('<div class="trakt_v2"></div>');
+        var body = $('<div class="trakt_v2__body"></div>');
+        var lines = [];          // массив Lampa.InteractionLine
+        var lastFocused = null;  // последняя активная карточка для toggle()
 
-        comp.create = function () {
-            var self = this;
-            if (!getToken()) {
-                self.empty(Lampa.Lang.translate('trakt_v2_no_token'));
-                return;
-            }
-            fetchAll()
-                .then(function (results) {
-                    self.build({ results: results, total_pages: 1 });
-                    if (self.activity && self.activity.scroll) {
-                        self.activity.scroll.onEnd = function () {};
-                    }
-                })
-                .catch(function (err) {
-                    var msg = (err && err.code === 'no_token')
-                        ? Lampa.Lang.translate('trakt_v2_no_token')
-                        : Lampa.Lang.translate('trakt_v2_load_error');
-                    self.empty(msg);
-                });
-        };
+        this.activity = null;
 
-        comp.next = function () { /* no pagination on Phase 1 */ };
+        function buildSectionLine(status, items) {
+            var title = statusLabel(status) + ' (' + items.length + ')';
+            var data = {
+                title: title,
+                results: items.length ? items : [],
+                source: 'tmdb',
+                noimage: true   // не рисуем фон карточки в качестве background — у нас своя страница
+            };
+            var params = {
+                object: object,
+                nomore: true    // не показывать "More" — мы загружаем всё за один раз
+            };
+            var line = new Lampa.InteractionLine(data, params);
+            line.create();
 
-        // Переопределяем onEnter каждой карточки. См. memory: reference_lampa_card_api.
-        comp.cardRender = function (object, element, card) {
-            card.onMenu = false;
-            card.onEnter = function () {
+            // Перехват onFocus, чтобы запоминать последнюю карточку и обновлять outer scroll
+            line.onFocus = function (card_data) {
+                lastFocused = line.render(true);
+                // Обновим вертикальный outer scroll, чтобы текущий ряд был виден
+                try { scroll.update($(line.render(true)), true); } catch (_) {}
+            };
+
+            line.onEnter = function (target, card_data) {
+                if (!card_data) return;
                 Lampa.Activity.push({
                     url: '',
                     component: 'full',
-                    id: element.id,
-                    method: element.method,
-                    card: element,
+                    id: card_data.id,
+                    method: card_data.method,
+                    card: card_data,
                     source: 'tmdb'
                 });
             };
+
+            // onUp/onDown — InteractionLine их вызывает, если Navigator.canmove не помог.
+            // Дадим стандартное поведение: возврат к outer controller, который сам разберётся.
+            line.onUp = function () {
+                if (Navigator.canmove('up')) Navigator.move('up');
+                else Lampa.Controller.toggle('head');
+            };
+            line.onDown = function () {
+                if (Navigator.canmove('down')) Navigator.move('down');
+            };
+            line.onBack = self.back;
+
+            return line;
+        }
+
+        function buildSections(results) {
+            // Группируем по статусу
+            var bystatus = { watchlist: [], progress: [], finished: [], upcoming: [], dropped: [] };
+            for (var i = 0; i < results.length; i++) {
+                var s = results[i].trakt_status;
+                if (bystatus[s]) bystatus[s].push(results[i]);
+            }
+
+            // Создаём по InteractionLine на каждый статус (даже если пусто — рисуем заголовок-плейсхолдер)
+            for (var k = 0; k < STATUS_ORDER.length; k++) {
+                var status = STATUS_ORDER[k];
+                var items = bystatus[status];
+                if (items.length === 0) {
+                    // Пустая секция — рисуем простой DOM-заглушку с заголовком и текстом «пусто»
+                    var $empty = $(
+                        '<div class="items-line items-line--type-default trakt_v2__empty-line">' +
+                          '<div class="items-line__head">' +
+                            '<div class="items-line__title">' +
+                              escapeHtml(statusLabel(status)) + ' (0)' +
+                            '</div>' +
+                          '</div>' +
+                          '<div class="items-line__body" style="padding:0.7em 1em;opacity:0.55">' +
+                            escapeHtml(Lampa.Lang.translate('trakt_v2_section_empty')) +
+                          '</div>' +
+                        '</div>'
+                    );
+                    body.append($empty);
+                } else {
+                    var line = buildSectionLine(status, items);
+                    lines.push(line);
+                    body.append(line.render());
+                }
+            }
+        }
+
+        function escapeHtml(s) {
+            return String(s == null ? '' : s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
+        this.create = function () {
+            if (!getToken()) {
+                this.empty(Lampa.Lang.translate('trakt_v2_no_token'));
+                return this.render();
+            }
+            if (this.activity) this.activity.loader(true);
+
+            fetchAll().then(function (results) {
+                buildSections(results);
+
+                scroll.minus();
+                scroll.append(body);
+                html.append(scroll.render());
+
+                if (self.activity) self.activity.loader(false);
+
+                // Если активити уже отрендерена и ждёт нас — сразу включаемся
+                if (self.activity && typeof self.activity.toggle === 'function') {
+                    self.activity.toggle();
+                }
+            }).catch(function (err) {
+                var msg = (err && err.code === 'no_token')
+                    ? Lampa.Lang.translate('trakt_v2_no_token')
+                    : Lampa.Lang.translate('trakt_v2_load_error');
+                self.empty(msg);
+            });
+
+            return this.render();
         };
 
-        return comp;
+        this.empty = function (text) {
+            var $msg = $(
+                '<div class="empty" style="padding:2em;text-align:center;">' +
+                  '<div class="empty__title">' + escapeHtml(text || '') + '</div>' +
+                '</div>'
+            );
+            html.empty().append($msg);
+            if (self.activity) self.activity.loader(false);
+        };
+
+        this.start = function () {
+            if (this.activity) this.activity.loader(false);
+
+            Lampa.Controller.add('content', {
+                link: this,
+                toggle: function () {
+                    Lampa.Controller.collectionSet(scroll.render());
+                    var firstCard;
+                    if (lastFocused) firstCard = lastFocused;
+                    else if (lines[0]) firstCard = lines[0].render(true);
+                    else firstCard = scroll.render().find('.selector').get(0);
+                    Lampa.Controller.collectionFocus(firstCard || false, scroll.render());
+                },
+                left: function () {
+                    if (Navigator.canmove('left')) Navigator.move('left');
+                    else Lampa.Controller.toggle('menu');
+                },
+                right: function () {
+                    if (Navigator.canmove('right')) Navigator.move('right');
+                },
+                up: function () {
+                    if (Navigator.canmove('up')) Navigator.move('up');
+                    else Lampa.Controller.toggle('head');
+                },
+                down: function () {
+                    if (Navigator.canmove('down')) Navigator.move('down');
+                },
+                back: this.back
+            });
+            Lampa.Controller.toggle('content');
+        };
+
+        this.back = function () {
+            Lampa.Activity.backward();
+        };
+
+        this.pause = function () {};
+        this.stop  = function () {};
+
+        this.render = function () {
+            return html;
+        };
+
+        this.destroy = function () {
+            try {
+                lines.forEach(function (l) { try { l.destroy(); } catch (_) {} });
+            } catch (_) {}
+            try { scroll.destroy(); } catch (_) {}
+            html.remove();
+            lines = [];
+        };
     }
+
 
     // ────────────────────────────────────────────────────────────────────
     // DOM-инъекция пункта в левое меню
