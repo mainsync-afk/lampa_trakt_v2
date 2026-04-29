@@ -54,6 +54,19 @@
  *    стрелял слишком поздно (или не на ту фазу — не выяснили).
  *  - Удалены: updateSidebarLabels, Listener.follow('full') (мёртвый код).
  *
+ * v0.1.16: новый порядок и билингвальные подписи рядов на главной странице.
+ *  - ROW_ORDER изменён с [watchlist, progress, finished, upcoming, dropped]
+ *    на [progress, watchlist, upcoming, finished, dropped] — Смотрю первым.
+ *  - Новые подписи рядов в формате «Русское (English)»:
+ *      Смотрю (Progress)
+ *      Закладки (Watchlist)
+ *      Продолжение следует (Upcoming)
+ *      Просмотрено (Finished)
+ *      Брошено (Dropped)
+ *  - Подписи через STATUS_ROW_LABEL и rowLabel(status). Сайдбар карточки и
+ *    действия не затронуты — там остаются короткие английские (с Unicode
+ *    маркерами ☐/☑/✓), узкого формата для action-меню.
+ *
  * v0.1.15: on-demand резолв _trakt_progress_seasons для tap Finished на шоу.
  *  - В v0.1.14 был баг: тап Finished на сериале со статусом None (например,
  *    «Больница Питт» в Watchlist=false) → postHistoryAddShow rejected с
@@ -162,7 +175,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '0.1.15';
+    var VERSION = '0.1.16';
     try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
@@ -185,16 +198,29 @@
     // Watchlist НЕ статус (см. reference_v2_data_model.md).
     // ────────────────────────────────────────────────────────────────────
     var STATUS = { PROGRESS: 'progress', FINISHED: 'finished', UPCOMING: 'upcoming', DROPPED: 'dropped' };
-    // Порядок рядов на главном экране. Watchlist первый и собирается отдельно.
-    var ROW_ORDER = ['watchlist', 'progress', 'finished', 'upcoming', 'dropped'];
+    // v0.1.16: порядок рядов на главном экране — Смотрю / Закладки / Продолжение
+    // следует / Просмотрено / Брошено (как в нативном Избранном Lampa).
+    var ROW_ORDER = ['progress', 'watchlist', 'upcoming', 'finished', 'dropped'];
     // Порядок пунктов в нативном сайдбаре карточки.
     var SIDEBAR_ORDER = ['progress', 'watchlist', 'upcoming', 'finished', 'dropped'];
+    // Подписи для пунктов сайдбара карточки — короткие английские (с Unicode
+    // маркером ☐/☑/✓ в labelFor). Используются в action-сайдбаре.
     var STATUS_LABEL = {
         watchlist: { ru: 'Watchlist', en: 'Watchlist', uk: 'Watchlist' },
         progress:  { ru: 'Progress',  en: 'Progress',  uk: 'Progress'  },
         finished:  { ru: 'Finished',  en: 'Finished',  uk: 'Finished'  },
         upcoming:  { ru: 'Upcoming',  en: 'Upcoming',  uk: 'Upcoming'  },
         dropped:   { ru: 'Dropped',   en: 'Dropped',   uk: 'Dropped'   }
+    };
+    // v0.1.16: билингвальные подписи рядов на главном экране — «Русское (English)».
+    // Английская часть в скобках — мост к коду / API / sidebar где используются
+    // английские action-имена.
+    var STATUS_ROW_LABEL = {
+        progress:  'Смотрю (Progress)',
+        watchlist: 'Закладки (Watchlist)',
+        upcoming:  'Продолжение следует (Upcoming)',
+        finished:  'Просмотрено (Finished)',
+        dropped:   'Брошено (Dropped)'
     };
 
     // ────────────────────────────────────────────────────────────────────
@@ -849,6 +875,11 @@
         return pack[l] || pack.en || status;
     }
 
+    // v0.1.16: подпись для ряда на главном экране (билингвальная).
+    function rowLabel(status) {
+        return STATUS_ROW_LABEL[status] || statusLabel(status);
+    }
+
     function MainComponent(object) {
         var self = this;
         var scroll = new Lampa.Scroll({ mask: true, over: true, step: 250 });
@@ -860,7 +891,7 @@
         this.activity = null;
 
         function buildSectionLine(status, items) {
-            var title = statusLabel(status) + ' (' + items.length + ')';
+            var title = rowLabel(status) + ' (' + items.length + ')';
             var data = {
                 title: title,
                 results: items.length ? items : [],
@@ -960,7 +991,7 @@
                         '<div class="items-line items-line--type-default trakt_v2__empty-line">' +
                           '<div class="items-line__head">' +
                             '<div class="items-line__title">' +
-                              escapeHtml(statusLabel(status)) + ' (0)' +
+                              escapeHtml(rowLabel(status)) + ' (0)' +
                             '</div>' +
                           '</div>' +
                           '<div class="items-line__body" style="padding:0.7em 1em;opacity:0.55">' +
