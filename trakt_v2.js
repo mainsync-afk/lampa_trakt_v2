@@ -1,181 +1,25 @@
 /*!
  * trakt_v2.js — Lampa-Trakt Plugin v2
- * Phase 1 + classifier + multi-section layout + write-actions:
- * пункт меню + Activity component + 5 секций + 5 пунктов в нативном
- * сайдбаре карточки.
  *
- * v0.1.4: переписана раскладка на нативные примитивы Lampa после ресёрча
- * нативного экрана «Избранное» (компонент `bookmarks`). Outer Lampa.Scroll
- * (vertical, mask:true, over:true) + 5 × Lampa.InteractionLine. Карточки
- * стандартные (через встроенный path InteractionLine → new Lampa.Card).
+ * Phase 2 (write-actions) реализована, идёт отладка матрицы переходов.
+ * Свой пункт меню → Activity с 5 рядами (Смотрю/Закладки/Продолжение
+ * следует/Просмотрено/Брошено), регистрация 5 пунктов в нативном
+ * action-сайдбаре карточки через Lampa.Manifest.plugins.
  *
- * v0.1.5: фикс D-pad навигации. Убран outer Controller.add('content') —
- * он конфликтовал с встроенным `items_line` controller InteractionLine
- * (нативный bookmarks тоже использует только `items_line`). Активация
- * первой линии через lines[0].toggle(); каждой линии заданы onUp/onDown,
- * которые переключают controller на соседний ряд через .toggle();
- * onLeft с самого левого края → выход в меню; onToggle синхронизирует
- * outer вертикальный scroll и триггерит lazy-load постеров через
- * scroll.update.
+ * Архитектура: см. SPEC_v2.md §«Раскладка экрана».
+ * Changelog: см. README.md #Changelog.
+ * Модель и матрица переходов: SPEC_v2.md + memory reference_v2_data_model.md.
  *
- * v0.1.6: вернули тонкий 'content' controller — НО с делегацией на
- * lastFocused.toggle() в его toggle(), без своих left/right/up/down
- * на активном слое. Это нужно для возврата фокуса из menu/head в активити:
- * фреймворк делает Controller.toggle('content') и наш content сразу
- * пере-активирует items_line. Постеры — теперь руками выпускаем
- * 'visible' event на каждой линии после монтажа, что триггерит
- * InteractionLine.visible() → Layer.visible(scroll.render) → lazy-load
- * картинок без необходимости прокрутки.
- *
- * v0.1.7: Phase 2 — write-actions через нативное контекстное меню карточки.
- * Концептуально: статус (один из 4: Progress/Upcoming/Finished/Dropped) стал
- * отделён от Watchlist-флажка (ортогональный boolean). Карточка может иметь
- * статус И WL одновременно. На главном экране ряд Watchlist показывает все
- * WL=true карточки независимо от статуса. Регистрация 5 пунктов в
- * Lampa.Manifest.plugins; tap-обработчики по матрице из reference_v2_data_model.md.
- *
- * v0.1.8: state-aware sidebar labels (попытка через Listener.follow) + render-fix дублей.
- *  - Lampa-обёртка плагинов выкидывает поля checkbox/collect/checked/selected
- *    из onContextMenu return (проверено пробником) — нативные галочки доступны
- *    только нативным группам «Избранное»/«Статус», которые мы НЕ используем.
- *    Решено выражать состояние Unicode-маркером в plugin.name. Обновлять имя
- *    пытались через Lampa.Listener.follow('full') — ОКАЗАЛОСЬ НЕ РАБОЧИМ:
- *    long-press на карточке в нашей папке открывает action-сайдбар напрямую,
- *    минуя full-card view, событие 'full' не дёргается.
- *  - Фикс 0.1.7: при попадании карточки в два ряда (WL + status) клонируем
- *    card-data в buildSections (Object.assign({}, c)). Без клонирования
- *    Lampa.Card мутировал общий объект и второй ряд молча терял карточку.
- *
- * v0.1.9: state-aware sidebar labels — попытка через Select.show patch.
- *  - Заменили Listener.follow('full') на патч Lampa.Select.show. Карточку
- *    ловили через line.onFocus → currentFocusedCard. На реальных тестах
- *    подписи всё равно не обновлялись: Lampa-исходник Card.onMenu читает
- *    plugin.name синхронно ВНУТРИ forEach по Manifest.plugins, и наш patch
- *    стрелял слишком поздно (или не на ту фазу — не выяснили).
- *  - Удалены: updateSidebarLabels, Listener.follow('full') (мёртвый код).
- *
- * v0.1.16: новый порядок и билингвальные подписи рядов на главной странице.
- *  - ROW_ORDER изменён с [watchlist, progress, finished, upcoming, dropped]
- *    на [progress, watchlist, upcoming, finished, dropped] — Смотрю первым.
- *  - Новые подписи рядов в формате «Русское (English)»:
- *      Смотрю (Progress)
- *      Закладки (Watchlist)
- *      Продолжение следует (Upcoming)
- *      Просмотрено (Finished)
- *      Брошено (Dropped)
- *  - Подписи через STATUS_ROW_LABEL и rowLabel(status). Сайдбар карточки и
- *    действия не затронуты — там остаются короткие английские (с Unicode
- *    маркерами ☐/☑/✓), узкого формата для action-меню.
- *
- * v0.1.15: on-demand резолв _trakt_progress_seasons для tap Finished на шоу.
- *  - В v0.1.14 был баг: тап Finished на сериале со статусом None (например,
- *    «Больница Питт» в Watchlist=false) → postHistoryAddShow rejected с
- *    'no_progress_seasons' (потому что fetchAll тянет /shows/<id>/progress
- *    только для шоу in_watched=true). На Trakt ничего не уходило.
- *  - Решение: ensureProgressSeasons(card) внутри postHistoryAddShow.
- *    1) Если есть card.trakt_ids.trakt → step 3.
- *    2) Иначе — резолв через GET /search/tmdb/<tmdb>?type=show, обогащаем
- *       card.trakt_ids найденными trakt/imdb/slug.
- *    3) GET /shows/<trakt_id>/progress/watched → seasons[] (включает все
- *       вышедшие эпизоды независимо от watched-state). Кешируем в
- *       card._trakt_progress_seasons чтобы повторные тапы не дёргали API.
- *  - Добавлены новые error codes для понятных нотификаций: no_aired_episodes
- *    (шоу с невышедшими эпизодами), trakt_id_resolve_failed, no_progress_response.
- *  - Старый notify «open card first to load episodes» удалён — был обманчивый
- *    (открытие карточки реально ничего не чинило).
- *
- * v0.1.14: фикс имени Lampa-section для Settings.
- *  - В v0.1.13 регистрировали addParam под component:'trakttv' (как было
- *    в v1). В LME-форке trakt_by_LME секцию переименовали в 'trakt' (см.
- *    trakt_by_LME.js:6698 addComponent({component:'trakt'})). Без правильного
- *    имени addParam silently ничего не делает — пункт не появлялся.
- *  - Поменяли component на 'trakt'. Лог-маркер тоже: '[trakt_v2] settings
- *    registered (trakt component, ...)' (раньше '(trakttv component, ...)').
- *
- * v0.1.13: Custom list для Dropped + Settings UI; ушли от hpw полностью.
- *  - Backlog #7 закрыт частично. Раньше: Dropped писали в hpw + hdr (двойник
- *    под видом «триплета»), для movies был notify «not yet supported».
- *    Теперь: пишем в hdr + custom list; movies без листа недоступны (явный
- *    notify «настройте папку Dropped в настройках»).
- *  - hpw НЕ пишем и НЕ читаем (backlog #10): Moviebase пишет туда «Stop
- *    watching» и не имеет UI для отмены — карточка залипает в hpw без
- *    возможности её достать. Если бы мы тоже туда писали, наш «un-drop»
- *    оставлял бы Moviebase-запись и UI был бы рассинхронизирован.
- *  - Канонизация v1 (fire-and-forget POST в недостающие ячейки с throttle)
- *    отложена — без hpw она нужна только между hdr и list, и вопрос как
- *    себя ведут другие клиенты ещё не закрыт.
- *  - Settings: Lampa.SettingsApi.addParam под component:'trakt' (имя секции
- *    trakt_by_LME — был 'trakttv' в старом trakt_by_lampame, в LME форке
- *    переименовали в 'trakt', см. trakt_by_LME.js:6698).
- *    Тип select с values из cached lists. fetchUserLists() вызывается в
- *    start() для refresh кеша (если есть токен).
- *  - droppedTmdb теперь type-aware — keyed по 'show:<tmdb>' / 'movie:<tmdb>'.
- *    Раньше было keyed по tmdb only (хватало, потому что hpw/hdr только
- *    shows); теперь list возвращает оба типа, нужна типобезопасность.
- *
- * v0.1.12: detectCardType — фикс мис-определения типа карточки в нативных папках.
- *  - Был баг: long-press на сериале в нативной папке (trending/movies/shows)
- *    → resolveCard возвращал 'movie' (потому что Lampa-нативные карточки не
- *    имеют method/card_type — наши единственный сигнал) → postWatchlistAdd
- *    слал { movies: [...] } с tmdb сериала → Trakt находил ДРУГОЙ фильм с
- *    тем же tmdb-id и добавлял его в WL. Юзер видел чужой фильм в WL row,
- *    сериал не попадал в Trakt.
- *  - resolveCard теперь использует detectCardType с приоритетами:
- *    (1) explicit method/card_type для наших карточек,
- *    (2) Lampa-эвристика: name/original_name/first_air_date/number_of_seasons
- *        => show (как сама Lampa определяет TV в card.js: type: data.name?'tv':'movie'),
- *    (3) default movie.
- *  - Сложные edge cases (карточка без TV-specific полей и без method) могут
- *    остаться мис-классифицированными — fallback на Trakt /search/tmdb/:id
- *    будет нужен в отдельной версии (см. SPEC_v2.md §«Резолв типа карточки»).
- *
- * v0.1.11: оптимистичное обновление кеша вместо Activity.replace.
- *  - Раньше после каждого write-action делали refreshScreenIfActive() →
- *    Lampa.Activity.replace() → весь экран пересобирался: новый fetchAll,
- *    ребилд 5 рядов, потеря фокуса. Юзер видел дёргающийся рефреш.
- *  - В нативной папке refreshScreenIfActive ничего не делал (мы не на нашем
- *    component) → LAST_RESULTS оставался stale → следующий long-press на
- *    той же карточке показывал старое состояние до повторного захода в нашу
- *    папку.
- *  - Решение: применить мутацию к карточке в LAST_RESULTS in-place по матрице
- *    действия (или добавить минимальную запись если карточки в кеше нет).
- *    Активити больше не дёргается. Сайдбар на той же карточке сразу
- *    показывает новое состояние через капчер-hook + labelFor → findInCache.
- *  - Trade-off: ряды на нашей странице НЕ реорганизуются мгновенно — карточки
- *    переезжают между рядами только на следующем заходе в папку. Это backlog
- *    item (DOM-уровень обновление без Activity.replace).
- *  - refreshScreenIfActive() оставлен как dead code на случай ручной кнопки
- *    «обновить» в будущих версиях.
- *
- * v0.1.10: state-aware sidebar labels — рабочая реализация через hover:long
- * capture-phase hook (после изучения src/interaction/card.js в lampa-source).
- *  - Card.onMenu в Lampa строит action-сайдбар на DOM event 'hover:long'
- *    (long-press на карточке). Внутри он делает Manifest.plugins.forEach и
- *    использует plugin.name КАК item.title. Если plugin.name свежий в
- *    момент forEach — Lampa отрендерит его как есть.
- *  - На карточке-DOM-элементе лежит el.card_data (JS-property, не data-*).
- *  - Регистрируем capture-phase listener на document для 'hover:long' —
- *    он гарантированно срабатывает ПЕРЕД bubble-listener-ом Lampa.
- *    Из event.target.closest('.card') читаем card_data → мутируем
- *    plugin.name на всех 5 наших entries через labelFor(action, card).
- *  - Бонус: тот же hook чинит Path 3 (long-press в нативной папке) — там
- *    тоже Lampa.Card, тоже hover:long, тоже card_data на DOM. Подписи
- *    станут state-aware и в native рядах.
- *  - Сохраняем v0.1.9 patchSelectShowForLabels как defensive layer на
- *    случай если capture-hook на каких-то платформах не пробьётся.
- *  - Маркеры: ☐ Watchlist / ☑ Watchlist (toggle, всегда виден чекбокс),
- *    Progress / ✓ Progress (single-select, ✓ только у активного).
- *
- * Архитектура: см. SPEC_v2.md §«Раскладка экрана»; механика sidebar:
- * см. memory reference_lampa_card_onmenu.md
- * Зависимости: Lampa runtime; токен Trakt берётся из Lampa.Storage (выпускается плагином trakt_by_LME)
- * Прокси Trakt API: https://apx.lme.isroot.in/trakt
- * TMDB API: https://api.themoviedb.org/3 (прямой, тот же ключ что у ядра Lampa)
+ * Зависимости:
+ *  - Lampa runtime
+ *  - trakt_by_LME (OAuth, scrobble, токен в Lampa.Storage('trakt_token'))
+ *  - Прокси Trakt API: https://apx.lme.isroot.in/trakt
+ *  - TMDB API: https://api.themoviedb.org/3 (тот же ключ, что у ядра Lampa)
  */
 (function () {
     'use strict';
 
-    var VERSION = '0.1.16';
+    var VERSION = '0.1.17';
     try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
@@ -198,26 +42,17 @@
     // Watchlist НЕ статус (см. reference_v2_data_model.md).
     // ────────────────────────────────────────────────────────────────────
     var STATUS = { PROGRESS: 'progress', FINISHED: 'finished', UPCOMING: 'upcoming', DROPPED: 'dropped' };
-    // v0.1.16: порядок рядов на главном экране — Смотрю / Закладки / Продолжение
-    // следует / Просмотрено / Брошено (как в нативном Избранном Lampa).
+    // Порядок рядов на главном экране.
     var ROW_ORDER = ['progress', 'watchlist', 'upcoming', 'finished', 'dropped'];
-    // Порядок пунктов в нативном сайдбаре карточки.
-    var SIDEBAR_ORDER = ['progress', 'watchlist', 'upcoming', 'finished', 'dropped'];
-    // Подписи для пунктов сайдбара карточки — короткие английские (с Unicode
-    // маркером ☐/☑/✓ в labelFor). Используются в action-сайдбаре.
+    // Порядок пунктов в нативном action-сайдбаре карточки.
+    // v0.1.17: Watchlist первым (отдельно от 4 статусов, разделяется separator-ом).
+    var SIDEBAR_ORDER = ['watchlist', 'progress', 'upcoming', 'finished', 'dropped'];
+    // v0.1.17: единая билингвальная карта подписей в формате «Русское (English)».
+    // Используется и для рядов главной страницы, и для пунктов сайдбара.
+    // Английская часть в скобках — мост к коду / API где используются action-имена.
     var STATUS_LABEL = {
-        watchlist: { ru: 'Watchlist', en: 'Watchlist', uk: 'Watchlist' },
-        progress:  { ru: 'Progress',  en: 'Progress',  uk: 'Progress'  },
-        finished:  { ru: 'Finished',  en: 'Finished',  uk: 'Finished'  },
-        upcoming:  { ru: 'Upcoming',  en: 'Upcoming',  uk: 'Upcoming'  },
-        dropped:   { ru: 'Dropped',   en: 'Dropped',   uk: 'Dropped'   }
-    };
-    // v0.1.16: билингвальные подписи рядов на главном экране — «Русское (English)».
-    // Английская часть в скобках — мост к коду / API / sidebar где используются
-    // английские action-имена.
-    var STATUS_ROW_LABEL = {
-        progress:  'Смотрю (Progress)',
         watchlist: 'Закладки (Watchlist)',
+        progress:  'Смотрю (Progress)',
         upcoming:  'Продолжение следует (Upcoming)',
         finished:  'Просмотрено (Finished)',
         dropped:   'Брошено (Dropped)'
@@ -753,10 +588,34 @@
                     if (n) n.in_watched = true;
                 }
             }
+            // v0.1.17 fix #2: items, существующие ТОЛЬКО в hidden_dropped или
+            // в custom list (без watched/wl), раньше выпадали из byKey →
+            // классификатор их не видел → карточки «исчезали» из UI после
+            // тапа Dropped из нативной папки. Эти процессоры добавляют такие
+            // items в byKey; droppedTmdbByType ниже ставит им флаг dropped.
+            function processHiddenDropped(arr) {
+                for (var i = 0; i < arr.length; i++) {
+                    var s = arr[i] && arr[i].show;  // hidden API только shows
+                    if (s && s.ids && s.ids.tmdb) ensureNode('show', s, null);
+                }
+            }
+            function processList(arr) {
+                for (var i = 0; i < arr.length; i++) {
+                    var it = arr[i];
+                    if (!it) continue;
+                    if (it.type === 'show' && it.show && it.show.ids && it.show.ids.tmdb) {
+                        ensureNode('show', it.show, it.listed_at);
+                    } else if (it.type === 'movie' && it.movie && it.movie.ids && it.movie.ids.tmdb) {
+                        ensureNode('movie', it.movie, it.listed_at);
+                    }
+                }
+            }
             processWatchlist(wlMovies, 'movie');
             processWatchlist(wlShows,  'show');
             processWatched(watchedMovies, 'movie');
             processWatched(watchedShows,  'show');
+            processHiddenDropped(hiddenDR);
+            processList(listItems);
 
             // Помечаем dropped по type-aware ключу (shows из hdr; shows+movies из list)
             Object.keys(byKey).forEach(function (k) {
@@ -870,14 +729,7 @@
     }
 
     function statusLabel(status) {
-        var l = uiLang();
-        var pack = STATUS_LABEL[status] || {};
-        return pack[l] || pack.en || status;
-    }
-
-    // v0.1.16: подпись для ряда на главном экране (билингвальная).
-    function rowLabel(status) {
-        return STATUS_ROW_LABEL[status] || statusLabel(status);
+        return STATUS_LABEL[status] || status;
     }
 
     function MainComponent(object) {
@@ -891,7 +743,7 @@
         this.activity = null;
 
         function buildSectionLine(status, items) {
-            var title = rowLabel(status) + ' (' + items.length + ')';
+            var title = statusLabel(status) + ' (' + items.length + ')';
             var data = {
                 title: title,
                 results: items.length ? items : [],
@@ -991,7 +843,7 @@
                         '<div class="items-line items-line--type-default trakt_v2__empty-line">' +
                           '<div class="items-line__head">' +
                             '<div class="items-line__title">' +
-                              escapeHtml(rowLabel(status)) + ' (0)' +
+                              escapeHtml(statusLabel(status)) + ' (0)' +
                             '</div>' +
                           '</div>' +
                           '<div class="items-line__body" style="padding:0.7em 1em;opacity:0.55">' +
@@ -1207,11 +1059,10 @@
             }
         }
         else if (action === 'dropped') {
-            if (type === 'movie') {
-                // Movies dropped в текущей версии не поддерживаем (backlog #7) —
-                // handler возвращает раньше, сюда не попадаем.
-                return;
-            }
+            // v0.1.17: убран legacy early-return для movie. С v0.1.13 movies+dropped
+            // поддерживается через custom list — handler сам отдаёт rejection с
+            // 'no_dropped_list_for_movie' если лист не настроен (тогда сюда не
+            // попадаем). Логика идентична для movie и show.
             if (oldStatus === STATUS.DROPPED) {
                 c.trakt_status = null;              // unset → reclassify на след. fetch
             } else {
@@ -1390,6 +1241,11 @@
     function rewriteOurItemTitles(items, card) {
         if (!Array.isArray(items)) return;
         var updated = 0;
+        var watchlistIdx = -1;
+        // Помечаем наши items: ставим __trakt_v2_action для последующей вставки
+        // separator-а. Идентификация по подстроке 'handleSidebarTap' в
+        // item.onSelect.toString() — Lampa оборачивает наш onContextLauch, но
+        // source оборачиваемой функции преобразуется в строку.
         for (var i = 0; i < items.length; i++) {
             var item = items[i];
             if (!item || typeof item.onSelect !== 'function') continue;
@@ -1399,10 +1255,27 @@
             var action = ourActionFromTitle(item.title);
             if (!action) continue;
             item.title = labelFor(action, card);
+            item.__trakt_v2_action = action;
+            if (action === 'watchlist') watchlistIdx = i;
             updated++;
+        }
+        // v0.1.17: вставляем separator после Watchlist (визуально отделяет
+        // toggle-флажок от 4 single-select статусов).
+        if (watchlistIdx >= 0 && watchlistIdx + 1 < items.length) {
+            var next = items[watchlistIdx + 1];
+            // Не вставляем дважды — на повторных open Lampa.Select.show может
+            // получить уже мутированный массив.
+            if (!next || !next.__trakt_v2_separator) {
+                items.splice(watchlistIdx + 1, 0, {
+                    title: '',
+                    separator: true,
+                    __trakt_v2_separator: true
+                });
+            }
         }
         try {
             console.log('[trakt_v2] rewriteOurItemTitles: updated=' + updated +
+                        ' wlIdx=' + watchlistIdx +
                         ' currentCard.id=' + (card && (card.id || (card.ids && card.ids.tmdb))));
         } catch (_) {}
     }
