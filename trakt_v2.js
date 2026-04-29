@@ -54,6 +54,23 @@
  *    стрелял слишком поздно (или не на ту фазу — не выяснили).
  *  - Удалены: updateSidebarLabels, Listener.follow('full') (мёртвый код).
  *
+ * v0.1.15: on-demand резолв _trakt_progress_seasons для tap Finished на шоу.
+ *  - В v0.1.14 был баг: тап Finished на сериале со статусом None (например,
+ *    «Больница Питт» в Watchlist=false) → postHistoryAddShow rejected с
+ *    'no_progress_seasons' (потому что fetchAll тянет /shows/<id>/progress
+ *    только для шоу in_watched=true). На Trakt ничего не уходило.
+ *  - Решение: ensureProgressSeasons(card) внутри postHistoryAddShow.
+ *    1) Если есть card.trakt_ids.trakt → step 3.
+ *    2) Иначе — резолв через GET /search/tmdb/<tmdb>?type=show, обогащаем
+ *       card.trakt_ids найденными trakt/imdb/slug.
+ *    3) GET /shows/<trakt_id>/progress/watched → seasons[] (включает все
+ *       вышедшие эпизоды независимо от watched-state). Кешируем в
+ *       card._trakt_progress_seasons чтобы повторные тапы не дёргали API.
+ *  - Добавлены новые error codes для понятных нотификаций: no_aired_episodes
+ *    (шоу с невышедшими эпизодами), trakt_id_resolve_failed, no_progress_response.
+ *  - Старый notify «open card first to load episodes» удалён — был обманчивый
+ *    (открытие карточки реально ничего не чинило).
+ *
  * v0.1.14: фикс имени Lampa-section для Settings.
  *  - В v0.1.13 регистрировали addParam под component:'trakttv' (как было
  *    в v1). В LME-форке trakt_by_LME секцию переименовали в 'trakt' (см.
@@ -145,7 +162,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '0.1.14';
+    var VERSION = '0.1.15';
     try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
@@ -325,10 +342,75 @@
     function postHistoryRemoveMovie(card) {
         return apiPost('/sync/history/remove', { movies: [{ ids: buildIdsObj(card) }] });
     }
+    // v0.1.15: on-demand резолв _trakt_progress_seasons. fetchAll тянет
+    // progress только для шоу с in_watched=true (т.е. completed > 0). Шоу
+    // со status=None (или wl-only, или из нативной папки) не имеют этих
+    // данных. Когда юзер тапает Finished на таком — резолвим на лету.
+    //
+    // Шаги:
+    //  1. Если есть trakt_id → step 3 сразу.
+    //  2. Если только tmdb → /search/tmdb/<tmdb>?type=show → берём first show
+    //     hit, кешируем trakt/imdb/slug обратно в card.trakt_ids.
+    //  3. /shows/<trakt_id>/progress/watched → seasons[] (все вышедшие эпизоды
+    //     независимо от watched-state). Кешируем в card._trakt_progress_seasons.
+    function ensureProgressSeasons(card) {
+        if (card._trakt_progress_seasons && card._trakt_progress_seasons.length) {
+            return Promise.resolve(card._trakt_progress_seasons);
+        }
+        var ids = card.trakt_ids || {};
+        var traktId = ids.trakt;
+        var tmdbId = ids.tmdb;
+
+        var traktIdPromise;
+        if (traktId) {
+            traktIdPromise = Promise.resolve(traktId);
+        } else if (tmdbId) {
+            traktIdPromise = apiGet('/search/tmdb/' + tmdbId + '?type=show').then(function (results) {
+                if (!Array.isArray(results) || !results.length) return null;
+                var hit = null;
+                for (var i = 0; i < results.length; i++) {
+                    var r = results[i];
+                    if (r && r.type === 'show' && r.show && r.show.ids && r.show.ids.trakt) { hit = r; break; }
+                }
+                if (!hit) return null;
+                // Обогащаем card.trakt_ids найденными id, чтобы следующие вызовы
+                // (например, postWatchlistAdd) тоже работали без re-resolve.
+                card.trakt_ids = card.trakt_ids || {};
+                card.trakt_ids.trakt = hit.show.ids.trakt;
+                if (hit.show.ids.imdb) card.trakt_ids.imdb = hit.show.ids.imdb;
+                if (hit.show.ids.slug) card.trakt_ids.slug = hit.show.ids.slug;
+                return hit.show.ids.trakt;
+            });
+        } else {
+            return Promise.reject({ code: 'no_ids_for_progress_resolve' });
+        }
+
+        return traktIdPromise.then(function (resolvedTraktId) {
+            if (!resolvedTraktId) return Promise.reject({ code: 'trakt_id_resolve_failed' });
+            try { console.log('[trakt_v2] resolving progress on-demand for trakt_id=' + resolvedTraktId); } catch (_) {}
+            return apiGet('/shows/' + resolvedTraktId + '/progress/watched').then(function (progress) {
+                if (!progress || !Array.isArray(progress.seasons)) {
+                    return Promise.reject({ code: 'no_progress_response' });
+                }
+                card._trakt_progress_seasons = progress.seasons;
+                try { console.log('[trakt_v2] progress resolved, seasons=' + progress.seasons.length); } catch (_) {}
+                return progress.seasons;
+            });
+        });
+    }
+
     function postHistoryAddShow(card) {
-        var seasons = card._trakt_progress_seasons;
-        if (!seasons || !seasons.length) return Promise.reject({ code: 'no_progress_seasons' });
-        return apiPost('/sync/history', buildHistoryAddShowPayload(card, new Date().toISOString()));
+        return ensureProgressSeasons(card).then(function (seasons) {
+            if (!seasons || !seasons.length) return Promise.reject({ code: 'no_progress_seasons' });
+            // Проверим, есть ли реально вышедшие эпизоды (фильтр на пустые seasons).
+            var hasAired = false;
+            for (var i = 0; i < seasons.length; i++) {
+                var s = seasons[i];
+                if (s && s.episodes && s.episodes.length && Number(s.number) !== 0) { hasAired = true; break; }
+            }
+            if (!hasAired) return Promise.reject({ code: 'no_aired_episodes' });
+            return apiPost('/sync/history', buildHistoryAddShowPayload(card, new Date().toISOString()));
+        });
     }
     // v0.1.13: запись в кастомный пользовательский лист.
     function postListAdd(listId, card) {
@@ -1204,7 +1286,10 @@
                 .then(function () { applyOptimisticUpdate(action, card); notify('Finished: added'); })
                 .catch(function (err) {
                     try { console.warn('[trakt_v2] finished show add failed', err); } catch (_) {}
-                    if (err && err.code === 'no_progress_seasons') notify('Finished: open card first to load episodes');
+                    var code = err && err.code;
+                    if (code === 'no_aired_episodes') notify('Finished: у сериала ещё нет вышедших эпизодов');
+                    else if (code === 'no_ids_for_progress_resolve' || code === 'trakt_id_resolve_failed') notify('Finished: не удалось определить сериал в Trakt');
+                    else if (code === 'no_progress_response' || code === 'no_progress_seasons') notify('Finished: не удалось получить данные эпизодов');
                     else notify(Lampa.Lang.translate('trakt_v2_load_error'));
                 });
         }
