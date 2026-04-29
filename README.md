@@ -60,6 +60,13 @@
 
 # Changelog
 
+## v0.1.18 — диагностика Trakt POST request/response
+
+- **Bug-под-следствием**: после тапа Dropped на сериале «Друзья и соседи» (was WL=true) — карточка корректно ушла из WL, попала в наш кастомный список «Брошено» в Trakt, но НЕ была помечена в `/users/hidden/dropped`. Lampa предположил «никогда не помечает в тракте dropped».
+- **Причина невидимости**: `apiPost` ничего не логировал, `.catch(() => null)` в `postDroppedSet` глушил любые ошибки. Если Trakt отвечал 2xx с `not_found` (silent reject — что v1 явно ловил), мы этого не видели.
+- **Fix**: `apiPost` теперь пишет в консоль request body (саммари ≤250 символов) и response status + ключевые поля (`added/deleted/not_found`). На 4xx — `console.warn` с body. На network/timeout — отдельные warn-ы.
+- Помогает также для будущей отладки матрицы переходов.
+
 ## v0.1.17 — фикс пропадания dropped-карточек + bilingual сайдбар + разделители
 
 - **Bug**: карточка из нативной папки тапом Dropped пропадала из UI после re-fetch. `fetchAll` строил `byKey` только из watchlist+watched-эндпоинтов; items, существующие ТОЛЬКО в custom list или hidden_dropped (без watched/wl), выпадали из классифицированного результата.

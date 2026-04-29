@@ -19,7 +19,7 @@
 (function () {
     'use strict';
 
-    var VERSION = '0.1.17';
+    var VERSION = '0.1.18';
     try { console.log('[trakt_v2] file loaded, version ' + VERSION + ' at ' + new Date().toISOString()); } catch (_) {}
     var COMPONENT = 'trakt_v2_main';
     var MENU_DATA_ATTR = 'trakt_v2_menu';
@@ -144,16 +144,39 @@
             xhr.setRequestHeader('trakt-api-version', '2');
             xhr.setRequestHeader('Authorization', 'Bearer ' + token);
             xhr.timeout = 20000;
+            // v0.1.18: диагностика request → response для каждого POST. На ответе
+            // показываем `added`/`deleted`/`not_found` саммари — Trakt может ответить
+            // 2xx но добавить 0 (silent reject), как наблюдалось в v1 (см. README).
+            try { console.log('[trakt_v2] POST ' + path + ' body=' + JSON.stringify(payload || {}).slice(0, 250)); } catch (_) {}
             xhr.onload = function () {
+                var bodyText = xhr.responseText || '';
                 if (xhr.status >= 200 && xhr.status < 300) {
-                    try { resolve(xhr.responseText ? JSON.parse(xhr.responseText) : null); }
-                    catch (e) { resolve(null); }
+                    var parsed = null;
+                    try { parsed = bodyText ? JSON.parse(bodyText) : null; } catch (e) {}
+                    try {
+                        var summary = '';
+                        if (parsed && typeof parsed === 'object') {
+                            if (parsed.added)     summary += ' added=' + JSON.stringify(parsed.added);
+                            if (parsed.deleted)   summary += ' deleted=' + JSON.stringify(parsed.deleted);
+                            if (parsed.not_found) summary += ' not_found=' + JSON.stringify(parsed.not_found);
+                            if (!summary) summary = ' resp=' + JSON.stringify(parsed).slice(0, 200);
+                        } else summary = ' resp=' + bodyText.slice(0, 200);
+                        console.log('[trakt_v2] POST ' + path + ' ' + xhr.status + summary);
+                    } catch (_) {}
+                    resolve(parsed);
                 } else {
-                    reject({ status: xhr.status, code: 'http_error', body: xhr.responseText });
+                    try { console.warn('[trakt_v2] POST ' + path + ' ' + xhr.status + ' body=' + bodyText.slice(0, 250)); } catch (_) {}
+                    reject({ status: xhr.status, code: 'http_error', body: bodyText });
                 }
             };
-            xhr.onerror = function () { reject({ status: 0, code: 'network' }); };
-            xhr.ontimeout = function () { reject({ status: 0, code: 'timeout' }); };
+            xhr.onerror = function () {
+                try { console.warn('[trakt_v2] POST ' + path + ' network error'); } catch (_) {}
+                reject({ status: 0, code: 'network' });
+            };
+            xhr.ontimeout = function () {
+                try { console.warn('[trakt_v2] POST ' + path + ' timeout'); } catch (_) {}
+                reject({ status: 0, code: 'timeout' });
+            };
             try { xhr.send(JSON.stringify(payload || {})); }
             catch (e) { reject({ status: 0, code: 'send_failed', error: e }); }
         });
